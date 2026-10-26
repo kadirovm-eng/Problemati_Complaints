@@ -3,7 +3,7 @@
 // @namespace    local.tickets.screenshots
 // @version      1.9
 // @description  Сверяет скриншот чека в тикете с данными тикета: сумма и кошелёк агента. Данные распознавания сайта подтверждаются распознаванием самой картинки (Google Apps Script с распознаванием Google Drive; без него — слабое распознавание в браузере); обход всех страниц, выгрузка в Excel
-// @match        https://REPLACE_ME/*
+// @match        https://th-managment.com/en/admin/backoffice/ExtendedPaymentRequestList
 // @require      https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js
 // @grant        GM_setClipboard
 // @grant        GM_getValue
