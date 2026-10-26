@@ -3,7 +3,7 @@
 // @namespace    local.tickets.numbers
 // @version      1.20
 // @description  Ищет тикеты, где нет номера из 11 цифр (Transaction ID / Inside comment) или нет Agent's file — в самом списке и в истории тикета (фоновым запросом, без открытия окон); обход всех страниц, выгрузка в Excel
-// @match        https://REPLACE_ME/*
+// @match        https://th-managment.com/en/admin/backoffice/ExtendedPaymentRequestList
 // @require      https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js
 // @grant        GM_setClipboard
 // @grant        GM_getValue
