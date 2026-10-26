@@ -3,7 +3,7 @@
 // @namespace    local.tickets.history
 // @version      1.5
 // @description  Для тикетов в выбранных статусах (Received (Fraud) (M), Create new transaction (M)) проверяет, был ли в истории статус Received (M): фоновым запросом (без открытия окон) или через окно Show; обход всех страниц, выгрузка в Excel
-// @match        https://REPLACE_ME/*
+// @match        https://th-managment.com/en/admin/backoffice/ExtendedPaymentRequestList
 // @require      https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js
 // @grant        GM_setClipboard
 // @grant        GM_getValue
