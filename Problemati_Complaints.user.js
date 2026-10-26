@@ -3,7 +3,7 @@
 // @namespace    local.tickets.checker
 // @version      2.2
 // @description  Меню проверки жалоб: файлы (Support/User), Country, метод по стране, Agent wallet / User's wallet — каждая проверка включается отдельно; обход всех страниц, выгрузка в Excel
-// @match        https://REPLACE_ME/*
+// @match        https://th-managment.com/en/admin/backoffice/ExtendedPaymentRequestList
 // @require      https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js
 // @grant        GM_setClipboard
 // @grant        GM_xmlhttpRequest
