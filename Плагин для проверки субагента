@@ -1,0 +1,328 @@
+// ==UserScript==
+// @name         Tickets: кошелёк агента → субагент
+// @namespace    local.tickets.wallet
+// @version      0.1
+// @description  Клик по номеру Agent's wallet в списке тикетов показывает, каким субагентам принадлежит этот номер (данные берутся со страницы Payment references)
+// @match        https://th-managment.com/*
+// @match        https://my-managment.com/*
+// @match        https://managment.io/*
+// @match        https://management.office.lan/*
+// @updateURL    https://github.com/kadirovm-eng/Problemati_Complaints/raw/refs/heads/main/wallet-subagent.user.js
+// @downloadURL  https://github.com/kadirovm-eng/Problemati_Complaints/raw/refs/heads/main/wallet-subagent.user.js
+// @run-at       document-idle
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  'use strict';
+  if (window.top !== window.self) return;                      // не запускаемся во встроенных страницах (в т.ч. в своём же скрытом окне поиска)
+
+  const BUILD_DATE = '2026-11-07';
+  const CFG = {
+    pagePath: '/en/admin/banktransfer/paymentreferences',      // страница, где по номеру кошелька ищется субагент
+    timeoutMs: 25000,                                          // сколько ждём результат поиска
+    cacheMin: 30,                                              // сколько минут помним найденное
+  };
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const digitsOnly = (s) => String(s || '').replace(/[\s\-_.]/g, '').toLowerCase();
+
+  // ---------- поиск на странице Payment references (скрытое окно, как будто вы ввели номер руками) ----------
+  const cache = new Map();
+  let queue = Promise.resolve();
+
+  async function lookup(wallet, opts) {
+    const key = digitsOnly(wallet);
+    const c = cache.get(key);
+    if (!(opts && opts.diag) && c && Date.now() - c.t < CFG.cacheMin * 60000) return c.data;
+    const job = () => doLookup(wallet, opts || {});
+    const p = queue.then(job, job);
+    queue = p.catch(() => { /* очередь не должна ломаться */ });
+    const data = await p;
+    if (data && !data.error) cache.set(key, { t: Date.now(), data });
+    return data;
+  }
+
+  async function waitFor(fn, ms) {
+    const t0 = Date.now();
+    for (;;) {
+      let v = null;
+      try { v = fn(); } catch (e) { /* страница могла перезагрузиться */ }
+      if (v) return v;
+      if (Date.now() - t0 > ms) return null;
+      await sleep(250);
+    }
+  }
+
+  function findSearchInput(doc) {
+    const bad = /^(hidden|checkbox|radio|submit|button|file|password|image|reset|color|range)$/i;
+    const all = [...doc.querySelectorAll('input, textarea')].filter((i) => !bad.test(i.type || '') && !i.disabled && !i.readOnly);
+    if (!all.length) return null;
+    const score = (i) => {
+      const t = norm([i.type, i.name, i.id, i.placeholder, i.getAttribute('aria-label'), i.className].join(' '));
+      let s = 0;
+      if (i.type === 'search') s += 5;
+      if (/search|поиск|find|filter|query|\bq\b/.test(t)) s += 4;
+      if (/wallet|number|account|reference|кошел|номер/.test(t)) s += 2;
+      if (i.getClientRects().length) s += 1;
+      return s;
+    };
+    return all.map((i) => [score(i), i]).sort((a, b) => b[0] - a[0])[0][1];
+  }
+
+  function findSearchButton(doc, input) {
+    const scope = (input.form || doc);
+    const btns = [...scope.querySelectorAll('button, input[type=submit], input[type=button], a.btn, [role=button]')].filter((b) => !b.disabled);
+    const byText = btns.find((b) => /search|find|поиск|найти|apply|filter|применить|show/i.test(norm(b.innerText || b.value || b.title || '')));
+    return byText || btns.find((b) => (b.type || '').toLowerCase() === 'submit') || null;
+  }
+
+  function setValue(win, input, v) {
+    const proto = input.tagName === 'TEXTAREA' ? win.HTMLTextAreaElement.prototype : win.HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+    input.focus();
+    setter.call(input, v);
+    ['input', 'change', 'keyup'].forEach((n) => input.dispatchEvent(new win.Event(n, { bubbles: true })));
+  }
+
+  function pressEnter(win, el) {
+    ['keydown', 'keypress', 'keyup'].forEach((n) => el.dispatchEvent(new win.KeyboardEvent(n, { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true })));
+  }
+
+  // строки таблиц, где встречается номер кошелька
+  function parseTables(doc, wallet) {
+    const w = digitsOnly(wallet), out = [];
+    doc.querySelectorAll('table').forEach((tb) => {
+      const trs = [...tb.querySelectorAll('tr')];
+      const headRow = trs.find((tr) => tr.querySelector('th'));
+      const heads = headRow ? [...headRow.children].map((c) => norm(c.innerText)) : [];
+      const iSub = heads.findIndex((h) => /sub\s*-?\s*agent/.test(h)) >= 0 ? heads.findIndex((h) => /sub\s*-?\s*agent/.test(h)) : heads.findIndex((h) => /agent|агент/.test(h));
+      const iLast = heads.findIndex((h) => /last\s*used|использ/.test(h));
+      trs.forEach((tr) => {
+        if (tr === headRow || !tr.querySelector('td')) return;
+        const cells = [...tr.children].map((c) => (c.innerText || '').replace(/\s+/g, ' ').trim());
+        if (!cells.some((c) => digitsOnly(c).includes(w))) return;
+        out.push({
+          subagent: iSub >= 0 ? cells[iSub] : '',
+          lastUsed: iLast >= 0 ? cells[iLast] : '',
+          cells, heads,
+        });
+      });
+    });
+    const seen = new Set();
+    return out.filter((r) => { const k = r.subagent + '|' + r.lastUsed + '|' + r.cells.join('~'); if (seen.has(k)) return false; seen.add(k); return true; });
+  }
+
+  const NO_RESULTS = /no\s+(matching\s+)?(records|results|data|entries)|nothing\s+found|not\s+found|нет\s+(данных|результатов|записей)|не\s+найден/i;
+
+  async function doLookup(wallet, opts) {
+    const diag = { url: '', inputs: [], buttons: [], forms: [], tables: [], net: [], note: '' };
+    const fr = document.createElement('iframe');
+    fr.style.cssText = 'position:fixed;left:-10000px;top:0;width:1300px;height:900px;border:0;visibility:hidden;pointer-events:none';
+    fr.setAttribute('aria-hidden', 'true');
+    fr.src = location.origin + CFG.pagePath;
+    diag.url = fr.src;
+    try {
+      document.body.appendChild(fr);
+      await new Promise((ok, no) => {
+        const t = setTimeout(() => no(new Error('страница поиска не загрузилась за ' + CFG.timeoutMs / 1000 + ' с')), CFG.timeoutMs);
+        fr.onload = () => { clearTimeout(t); ok(); };
+        fr.onerror = () => { clearTimeout(t); no(new Error('страница поиска не загрузилась')); };
+      });
+      let doc;
+      try { doc = fr.contentDocument; if (!doc || !doc.body || !doc.body.innerHTML) throw new Error('empty'); } catch (e) {
+        return { error: 'страница поиска не открывается во встроенном виде (запрет встраивания или другой домен)', diag };
+      }
+      if (doc.querySelector('input[type=password]')) return { error: 'страница поиска просит войти — откройте её и войдите, затем повторите', diag };
+      // запоминаем сетевые запросы страницы — они нужны для диагностики
+      try {
+        const w = fr.contentWindow;
+        const of = w.fetch; if (of) w.fetch = function (...a) { try { diag.net.push('fetch ' + (a[1] && a[1].method || 'GET') + ' ' + String(a[0] && a[0].url || a[0]).slice(0, 200)); } catch (e) { /* ignore */ } return of.apply(this, a); };
+        const oo = w.XMLHttpRequest.prototype.open; w.XMLHttpRequest.prototype.open = function (m, u) { try { diag.net.push('xhr ' + m + ' ' + String(u).slice(0, 200)); } catch (e) { /* ignore */ } return oo.apply(this, arguments); };
+      } catch (e) { /* не критично */ }
+
+      const input = await waitFor(() => findSearchInput(fr.contentDocument), 12000);
+      if (!input) return { error: 'на странице поиска не найдено поле ввода', diag: collectDiag(fr.contentDocument, diag) };
+      diag.inputs = [...fr.contentDocument.querySelectorAll('input, textarea')].slice(0, 12).map((i) => ({ tag: i.tagName, type: i.type, name: i.name, id: i.id, placeholder: i.placeholder, picked: i === input }));
+
+      const win = fr.contentWindow;
+      setValue(win, input, wallet);
+      const btn = findSearchButton(fr.contentDocument, input);
+      if (btn) { try { btn.click(); } catch (e) { /* ignore */ } }
+      else { pressEnter(win, input); try { if (input.form && input.form.requestSubmit) input.form.requestSubmit(); } catch (e) { /* ignore */ } }
+      diag.note = btn ? 'нажата кнопка: ' + norm(btn.innerText || btn.value || btn.type) : 'нажат Enter / отправлена форма';
+
+      // ждём результат (страница могла перезагрузиться или обновить таблицу скриптом)
+      const t0 = Date.now();
+      let found = [];
+      while (Date.now() - t0 < CFG.timeoutMs) {
+        await sleep(350);
+        let d;
+        try { d = fr.contentDocument; if (!d || !d.body) continue; } catch (e) { continue; }
+        found = parseTables(d, wallet);
+        if (found.length) { await sleep(700); try { found = parseTables(fr.contentDocument, wallet); } catch (e) { /* оставляем прежнее */ } break; }
+        if (Date.now() - t0 > 3000 && NO_RESULTS.test(d.body.innerText || '')) break;
+        // кнопку и Enter повторяем один раз, если страница не отреагировала
+        if (Date.now() - t0 > 6000 && !diag.retried) {
+          diag.retried = true;
+          try { const i2 = findSearchInput(d); if (i2) { setValue(fr.contentWindow, i2, wallet); pressEnter(fr.contentWindow, i2); } } catch (e) { /* ignore */ }
+        }
+      }
+      collectDiag(fr.contentDocument, diag);
+      return { wallet, matches: found, at: Date.now(), diag };
+    } catch (e) {
+      return { error: e.message || String(e), diag };
+    } finally {
+      fr.remove();
+    }
+  }
+
+  function collectDiag(doc, diag) {
+    try {
+      diag.buttons = [...doc.querySelectorAll('button, input[type=submit]')].slice(0, 10).map((b) => norm(b.innerText || b.value));
+      diag.forms = [...doc.querySelectorAll('form')].slice(0, 5).map((f) => ({ action: f.getAttribute('action'), method: f.method }));
+      diag.tables = [...doc.querySelectorAll('table')].slice(0, 4).map((t) => {
+        const trs = [...t.querySelectorAll('tr')];
+        return { headers: [...(trs.find((r) => r.querySelector('th')) || { children: [] }).children].map((c) => norm(c.innerText)), rows: trs.length, sample: trs.filter((r) => r.querySelector('td')).slice(0, 3).map((r) => [...r.children].map((c) => (c.innerText || '').trim().slice(0, 40))) };
+      });
+    } catch (e) { /* ignore */ }
+    return diag;
+  }
+
+  // ---------- окно с результатом (закруглённые карточки) ----------
+  const css = document.createElement('style');
+  css.textContent = `
+    #tw-ov { position: fixed; inset: 0; z-index: 2147483646; background: rgba(10,10,10,.55); display: flex; align-items: center; justify-content: center; font: 14px/1.4 -apple-system, "Segoe UI", Roboto, Arial, sans-serif; }
+    #tw-card { width: 460px; max-width: calc(100vw - 32px); max-height: calc(100vh - 48px); overflow: auto; background: #2b2d31; color: #e8e9ec; border-radius: 22px; padding: 18px; box-shadow: 0 18px 60px rgba(0,0,0,.55); }
+    #tw-card * { box-sizing: border-box; }
+    .tw-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 12px; }
+    .tw-pill { display: inline-block; background: #3b3e45; color: #cfd2d8; border-radius: 999px; padding: 4px 12px; font-size: 12px; }
+    .tw-x { width: 30px; height: 30px; border-radius: 50%; border: none; background: #3b3e45; color: #e8e9ec; font-size: 16px; cursor: pointer; }
+    .tw-x:hover { background: #4a4e57; }
+    .tw-wallet { background: #35383e; border-radius: 16px; padding: 12px 14px; margin-bottom: 10px; display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    .tw-wallet b { font: 600 17px/1.3 Consolas, Menlo, monospace; word-break: break-all; color: #fff; }
+    .tw-btn { border: none; border-radius: 999px; background: #4a4e57; color: #fff; padding: 6px 14px; font-size: 12px; cursor: pointer; white-space: nowrap; }
+    .tw-btn:hover { background: #5b606b; }
+    .tw-item { background: #35383e; border-radius: 16px; padding: 12px 14px; margin-bottom: 8px; }
+    .tw-item.tw-hit { outline: 2px solid #3fb27f; }
+    .tw-name { font-weight: 700; color: #fff; font-size: 15px; }
+    .tw-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+    .tw-last { background: #2b2d31; border-radius: 999px; padding: 3px 12px; font-size: 12px; color: #aab0bb; }
+    .tw-ok { background: #1f4d3a; color: #7be0b0; }
+    .tw-warn { background: #5a2a2a; color: #ffa6a6; }
+    .tw-muted { color: #9aa0ab; font-size: 12px; margin-top: 8px; }
+    .tw-skel { height: 54px; border-radius: 16px; background: linear-gradient(90deg, #35383e, #40444b, #35383e); background-size: 200% 100%; animation: tw-s 1.2s infinite; margin-bottom: 8px; }
+    @keyframes tw-s { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+    td[data-tw] { cursor: pointer; text-decoration: underline dotted; text-underline-offset: 3px; }
+    td[data-tw]:hover { background-color: rgba(47,84,235,.10); }
+    #tw-launch { position: fixed; right: 364px; bottom: 12px; z-index: 999999; background: #2f54eb; color: #fff; border: none; border-radius: 20px; box-sizing: border-box; width: 80px; padding: 8px 0; text-align: center; white-space: nowrap; font: 700 13px Arial, sans-serif; cursor: pointer; box-shadow: 0 2px 10px rgba(0,0,0,.35); }
+    #tw-panel { position: fixed; right: 364px; bottom: 56px; z-index: 999999; width: 300px; background: #fff; color: #222; border: 2px solid #2f54eb; border-radius: 14px; padding: 12px; font: 13px/1.4 Arial, sans-serif; box-shadow: 0 4px 16px rgba(0,0,0,.3); display: none; }
+    #tw-panel input { width: 100%; padding: 6px 8px; border: 1px solid #bbb; border-radius: 8px; margin: 6px 0; }
+    #tw-panel button { border: 1px solid #2f54eb; background: #f0f4ff; color: #1d39c4; border-radius: 999px; padding: 5px 12px; margin: 2px 4px 2px 0; cursor: pointer; font-size: 12px; }
+    #tw-panel .tw-ver { color: #888; font-size: 11px; }
+    #tw-msg { font-size: 12px; color: #555; margin-top: 6px; white-space: pre-wrap; }
+  `;
+  document.head.appendChild(css);
+
+  const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  let closeCurrent = null;
+
+  function openWindow(wallet, ticketSub) {
+    if (closeCurrent) closeCurrent();
+    const ov = document.createElement('div');
+    ov.id = 'tw-ov';
+    ov.innerHTML = `<div id="tw-card" role="dialog" aria-label="Кошелёк агента">
+      <div class="tw-top"><span class="tw-pill">Agent's wallet</span><button class="tw-x" title="Закрыть (Esc)">✕</button></div>
+      <div class="tw-wallet"><b>${esc(wallet)}</b><button class="tw-btn" data-copy>Копировать</button></div>
+      <div id="tw-body"><div class="tw-skel"></div><div class="tw-skel" style="opacity:.6"></div><div class="tw-muted">Ищу этот номер на странице Payment references…</div></div>
+    </div>`;
+    document.body.appendChild(ov);
+    const close = () => { ov.remove(); document.removeEventListener('keydown', onKey, true); closeCurrent = null; };
+    const onKey = (e) => { if (e.key === 'Escape') close(); };
+    closeCurrent = close;
+    document.addEventListener('keydown', onKey, true);
+    ov.addEventListener('mousedown', (e) => { if (e.target === ov) close(); });
+    ov.querySelector('.tw-x').onclick = close;
+    ov.querySelector('[data-copy]').onclick = (e) => { try { navigator.clipboard.writeText(wallet); e.target.textContent = 'Скопировано ✓'; } catch (x) { /* ignore */ } };
+    const body = ov.querySelector('#tw-body');
+
+    lookup(wallet).then((res) => {
+      if (!document.body.contains(ov)) return;
+      if (res.error) {
+        body.innerHTML = `<div class="tw-item"><div class="tw-name">Не удалось найти</div><div class="tw-muted">${esc(res.error)}</div><div class="tw-row"><a class="tw-btn" style="text-decoration:none" target="_blank" href="${esc(location.origin + CFG.pagePath)}">Открыть страницу поиска</a></div></div>`;
+        return;
+      }
+      if (!res.matches.length) {
+        body.innerHTML = `<div class="tw-item"><div class="tw-name">Субагент не найден</div><div class="tw-muted">На странице Payment references нет строк с этим номером.</div></div>`;
+        return;
+      }
+      const sameSub = (a) => ticketSub && a && (norm(a) === norm(ticketSub) || norm(a).includes(norm(ticketSub)) || norm(ticketSub).includes(norm(a)));
+      const hit = res.matches.some((m) => sameSub(m.subagent));
+      body.innerHTML = res.matches.map((m) => {
+        const name = m.subagent || m.cells.filter(Boolean).slice(0, 3).join(' · ');
+        return `<div class="tw-item${sameSub(m.subagent) ? ' tw-hit' : ''}">
+          <div class="tw-name">${esc(name)}</div>
+          <div class="tw-row">${m.lastUsed ? `<span class="tw-last">last used: ${esc(m.lastUsed)}</span>` : ''}${sameSub(m.subagent) ? '<span class="tw-last tw-ok">✓ как в тикете</span>' : ''}</div>
+        </div>`;
+      }).join('') +
+        (ticketSub ? `<div class="tw-row"><span class="tw-last ${hit ? 'tw-ok' : 'tw-warn'}">${hit ? '✓' : '⚠'} Субагент в тикете: ${esc(ticketSub)}${hit ? '' : ' — не совпадает с найденными'}</span></div>` : '') +
+        `<div class="tw-muted">Найдено: ${res.matches.length}. Данные со страницы Payment references.</div>`;
+    });
+  }
+
+  // ---------- клик по номеру в колонке «Agent's wallet» ----------
+  function markCells() {
+    document.querySelectorAll('th').forEach((th) => {
+      if (!/agent.?s\s*wallet/.test(norm(th.innerText))) return;
+      const table = th.closest('table'), row = th.parentElement;
+      if (!table || !row) return;
+      const idx = [...row.children].indexOf(th);
+      const subIdx = [...row.children].findIndex((c) => norm(c.innerText) === 'subagent');
+      table.querySelectorAll('tbody tr').forEach((tr) => {
+        const td = tr.children[idx];
+        if (!td || td.hasAttribute('data-tw')) return;
+        const t = (td.innerText || '').trim();
+        if (!t || t.length > 40) return;
+        td.setAttribute('data-tw', '1');
+        if (subIdx >= 0) td.setAttribute('data-tw-sub', (tr.children[subIdx] && tr.children[subIdx].innerText || '').trim());
+        td.title = 'Клик — показать, каким субагентам принадлежит номер';
+      });
+    });
+  }
+  document.addEventListener('click', (e) => {
+    const td = e.target.closest && e.target.closest('td[data-tw]');
+    if (!td || e.target.closest('a, button, input')) return;
+    const wallet = (td.innerText || '').trim().split(/\s+/)[0];
+    if (wallet) openWindow(wallet, td.getAttribute('data-tw-sub') || '');
+  });
+  let mt = 0;
+  new MutationObserver(() => { clearTimeout(mt); mt = setTimeout(markCells, 300); }).observe(document.body, { childList: true, subtree: true });
+  markCells();
+
+  // ---------- кнопка и меню плагина ----------
+  const launch = document.createElement('button');
+  launch.id = 'tw-launch'; launch.type = 'button'; launch.textContent = 'Кошелёк'; launch.title = 'Кошелёк агента → субагент';
+  document.body.appendChild(launch);
+  const panel = document.createElement('div');
+  panel.id = 'tw-panel';
+  panel.innerHTML = `<b>Кошелёк агента → субагент</b> <span class="tw-ver">v0.1 · ${BUILD_DATE.split('-').reverse().join('.')}</span>
+    <div style="font-size:11px;color:#666;margin-top:4px">В списке тикетов нажмите на номер в колонке «Agent's wallet» — откроется окно с субагентами. Или введите номер здесь:</div>
+    <input id="tw-in" placeholder="номер кошелька агента" autocomplete="off">
+    <button id="tw-find">Найти</button><button id="tw-diag">Диагностика</button><button id="tw-clr">Очистить кэш</button>
+    <div id="tw-msg"></div>`;
+  document.body.appendChild(panel);
+  launch.onclick = () => { panel.style.display = panel.style.display === 'block' ? 'none' : 'block'; };
+  const msg = (t) => { panel.querySelector('#tw-msg').textContent = t; };
+  panel.querySelector('#tw-find').onclick = () => { const v = panel.querySelector('#tw-in').value.trim(); if (v) openWindow(v, ''); else msg('Введите номер.'); };
+  panel.querySelector('#tw-in').addEventListener('keydown', (e) => { if (e.key === 'Enter') panel.querySelector('#tw-find').click(); });
+  panel.querySelector('#tw-clr').onclick = () => { cache.clear(); msg('Кэш очищен.'); };
+  panel.querySelector('#tw-diag').onclick = async () => {
+    const v = panel.querySelector('#tw-in').value.trim();
+    if (!v) { msg('Введите номер кошелька в поле выше и нажмите «Диагностика» ещё раз.'); return; }
+    msg('Проверяю страницу поиска…');
+    const res = await lookup(v, { diag: true });
+    const txt = JSON.stringify({ wallet: v, error: res.error || null, matches: (res.matches || []).slice(0, 5), diag: res.diag }, null, 1);
+    try { await navigator.clipboard.writeText(txt); msg('Диагностика скопирована в буфер — отправьте её разработчику.\n' + (res.error ? 'Ошибка: ' + res.error : 'Найдено строк: ' + (res.matches || []).length)); }
+    catch (e) { console.log(txt); msg('Не удалось скопировать (см. консоль браузера, F12).'); }
+  };
+})();
