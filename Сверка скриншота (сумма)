@@ -1,0 +1,1418 @@
+// ==UserScript==
+// @name         Tickets: сверка скриншота (сумма)
+// @namespace    local.tickets.screenshots
+// @version      1.47
+// @updateURL    https://github.com/kadirovm-eng/Problemati_Complaints/raw/refs/heads/main/screenshot-check.user.js
+// @downloadURL  https://github.com/kadirovm-eng/Problemati_Complaints/raw/refs/heads/main/screenshot-check.user.js
+// @description  Сверяет скриншот чека в тикете с суммой тикета. Данные распознавания сайта подтверждаются распознаванием самой картинки (Google Apps Script с распознаванием Google Drive; без него — слабое распознавание в браузере); обход всех страниц, выгрузка в Excel
+// @match        https://th-managment.com/en/admin/backoffice/ExtendedPaymentRequestList
+// @require      https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js
+// @grant        GM_setClipboard
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
+// @connect      *
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const CFG = {
+    ticketHeader: 'ticket id',               // колонка Ticket ID в списке
+    historyHeader: 'ticket history',         // колонка Ticket history (если есть; помогает найти главную таблицу)
+    histMarker: 'date of ticket update',     // по этому заголовку узнаём таблицу истории
+    supportFilesHeader: /^support.*files?$/,   // колонка Support team's files: скрин может лежать и там
+    userFilesHeader: /^user'?s? files?$/,    // колонка User files: оттуда берём ссылки на скриншоты
+    historyApi: '/admin/backoffice/paymentsupporthistory',
+    concurrency: 3,                  // сколько запросов истории идёт одновременно (сервер отвечает 529 при перегрузке)
+    apiGapMs: 200,                   // пауза после каждого запроса в каждом потоке
+    apiRetries: 5,                   // повторы при 429/5xx
+    apiBackoffMs: 1500,              // первая пауза перед повтором, дальше ×2
+    pagerSelector: null,             // например '.my-pager' — если автопоиск пагинации не сработает
+    nextSelector: null,              // например '.pagination li:last-child a' — если автопоиск кнопки "далее" не сработает
+    pageWaitMs: 20000,               // ожидание загрузки страницы (растёт с каждой повторной попыткой)
+    retries: 3,                      // сколько раз пробовать перейти на следующую страницу
+  };
+
+  // страница сайта (скрипт работает в изолированной среде Tampermonkey, поэтому перехваты делаем через unsafeWindow)
+  const PW = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+
+  // запоминаем заголовки, с которыми сам сайт обращается за историей (токены и т.п.), чтобы повторять их в фоновых запросах
+  const learned = {};
+  (function () {
+    try {
+      const XP = PW.XMLHttpRequest && PW.XMLHttpRequest.prototype;
+      if (!XP) return;
+      const o = XP.open, sh = XP.setRequestHeader, sd = XP.send;
+      XP.open = function (m, u) { this.__tsU = String(u); this.__tsH = {}; return o.apply(this, arguments); };
+      XP.setRequestHeader = function (k, v) { if (this.__tsH) this.__tsH[k] = v; return sh.apply(this, arguments); };
+      XP.send = function () {
+        if (this.__tsU && this.__tsU.indexOf('paymentsupporthistory') >= 0) Object.assign(learned, this.__tsH);
+        return sd.apply(this, arguments);
+      };
+    } catch (e) { /* перехват необязателен */ }
+  })();
+
+  const COLORS = { nosum: '#ffbb96', bad: '#ff7875', review: '#ffe58f', ok: '#d9f7be', error: '#d9d9d9', nofile: '#ececec' };
+
+  const norm = (s) => (s || '').replace(/[’`]/g, "'").replace(/\s+/g, ' ').trim().toLowerCase();
+  const txt = (el) => (el ? (el.innerText !== undefined ? el.innerText : el.textContent) || '' : '');
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const visible = (el) => !!el && !!(el.offsetWidth || el.offsetHeight || (el.getClientRects && el.getClientRects().length));
+  const statusEq = (a, b) => norm(a) === norm(b);
+  const clickEl = (el) => (typeof el.click === 'function' ? el.click() : el.dispatchEvent(new MouseEvent('click', { bubbles: true })));
+  async function waitFor(fn, ms, step = 150) {
+    const t = Date.now();
+    for (;;) {
+      let v = null;
+      try { v = fn(); } catch (e) { v = null; }
+      if (v) return v;
+      if (Date.now() - t > ms) return null;
+      await sleep(step);
+    }
+  }
+
+  // ---------- настройки (сохраняются между сессиями) ----------
+  // ===== НАСТРОЙКА АДМИНИСТРАТОРА =====
+  // Впишите адрес приложения Apps Script и секретное слово ОДИН раз перед публикацией файла.
+  // Если оба значения заданы, сотрудники их не видят и не могут изменить в меню; распознавание всегда включено.
+  const LOCKED = { gurl: 'https://script.google.com/a/macros/mailbox366.com/s/AKfycbzXbMYddD94SGd6qCt09I_-kA6yxBWbTCkBOEN-19zzsRiYsgf9jrJTM8e0IUaTCjw9/exec https://script.google.com/macros/s/AKfycbzcbmBauvF8A6Z3rzHe9Uow8qPdtqg5_vW6u6L7I-Q3Am01EIXrEpPJ8Ir0Xpy787Mr/exec', gsecret: 'kama' };
+  const IS_LOCKED = !!(LOCKED.gurl && LOCKED.gsecret);
+  const SKEY = 'ts_settings_v1';
+  const DEFAULTS = { gurl: '', gsecret: '', gkey: '', ocr: true, first: true, hide: false, badges: true, open: false, all: false };
+  function loadSettings() {
+    let raw = null;
+    // настройки хранятся и в Tampermonkey, и в localStorage сайта: если скрипт переустановлен/переименован и хранилище Tampermonkey пустое — берём копию из localStorage
+    try { if (typeof GM_getValue === 'function') raw = GM_getValue(SKEY, null); } catch (e) { /* ignore */ }
+    if (!raw) { try { raw = localStorage.getItem(SKEY); } catch (e) { /* ignore */ } }
+    try { return Object.assign({}, DEFAULTS, raw ? JSON.parse(raw) : {}); } catch (e) { return Object.assign({}, DEFAULTS); }
+  }
+  const S = loadSettings();
+  if (IS_LOCKED) { S.gurl = LOCKED.gurl; S.gsecret = LOCKED.gsecret; S.gkey = ''; S.ocr = true; }
+  try { if (S.gurl) localStorage.setItem(SKEY, JSON.stringify(S)); } catch (e) { /* ignore */ }
+  function saveSettings() {
+    try {
+      const raw = JSON.stringify(IS_LOCKED ? Object.assign({}, S, { gurl: '', gsecret: '' }) : S);          // зашитые адрес и слово в хранилище не копируем
+      if (typeof GM_setValue === 'function') GM_setValue(SKEY, raw);
+      try { localStorage.setItem(SKEY, raw); } catch (e2) { /* ignore */ }
+    } catch (e) { /* ignore */ }
+  }
+
+  // ---------- таблица истории (чтобы не принять её за список) ----------
+  function isHistoryTable(t) {
+    return !!t && [...t.querySelectorAll('th')].some((x) => norm(txt(x)).includes(CFG.histMarker)) &&
+      ![...t.querySelectorAll('th')].some((x) => norm(txt(x)).includes(CFG.historyHeader));
+  }
+
+  // ---------- список жалоб ----------
+  function analyze() {
+    const ths = [...document.querySelectorAll('th')];
+    const cands = ths.filter((th) => norm(txt(th)).includes(CFG.ticketHeader));
+    const hasHist = (t) => t && [...t.querySelectorAll('th')].some((x) => norm(txt(x)).includes(CFG.historyHeader));
+    const tTh = cands.find((th) => hasHist(th.closest('table'))) || cands.find((th) => !isHistoryTable(th.closest('table')));
+    if (!tTh) return null;
+    const table = tTh.closest('table');
+    const heads = [...tTh.parentElement.children].map((c) => norm(txt(c)));
+    const idx = {
+      ticket: heads.findIndex((h) => h.includes(CFG.ticketHeader)),
+      user: heads.findIndex((h) => CFG.userFilesHeader.test(h)),
+      sup: heads.findIndex((h) => CFG.supportFilesHeader.test(h)),
+      cur: heads.findIndex((h) => /currency|валют/.test(h)),
+    };
+    let trs = [...table.querySelectorAll(':scope > tbody > tr')];
+    if (!trs.length) trs = [...table.querySelectorAll('tbody tr')];
+    const res = [];
+    trs.forEach((tr) => {
+      const cells = tr.children;
+      if (cells.length <= Math.max(idx.ticket, idx.user, idx.sup)) return;
+      const id = (cells[idx.ticket].innerText || '').trim();
+      if (!id) return;
+      const grab = (i) => (i >= 0 && cells[i]) ? [...cells[i].querySelectorAll('a[href],img[src]')].map((e) => e.getAttribute('href') || e.getAttribute('src')).filter((h) => h && !/^\s*javascript:/i.test(h)) : [];
+      const links = (idx.user >= 0 || idx.sup >= 0) ? [...new Set([...grab(idx.user), ...grab(idx.sup)])].slice(0, 5) : null;
+      res.push({ tr, id, tCell: cells[idx.ticket], userLinks: links, cur: idx.cur >= 0 && cells[idx.cur] ? (cells[idx.cur].innerText || '').trim() : '' });
+    });
+    res.table = table; res.idx = idx;
+    return res;
+  }
+
+  // ---------- сверка скриншотов: данные распознавания сайта (socratResults) против суммы и кошелька тикета ----------
+  function parseSoc(v) {
+    if (v == null || v === '') return [];
+    let x = v;
+    if (typeof x === 'string') { try { x = JSON.parse(x); } catch (e) { return []; } }
+    if (!Array.isArray(x)) x = x && typeof x === 'object' ? [x] : [];
+    return x.filter((o) => o && typeof o === 'object');
+  }
+  // арабско-индийские (٠-٩) и персидские (۰-۹) цифры → обычные; арабские разделители → . и ,
+  function asciiDigits(t) {
+    return String(t == null ? '' : t)
+      .replace(/[٠-٩]/g, (c) => String(c.charCodeAt(0) - 0x0660))
+      .replace(/[۰-۹]/g, (c) => String(c.charCodeAt(0) - 0x06F0))
+      .replace(/[\u200E\u200F\u202A-\u202E\u2066-\u2069\u061C]/g, '')
+      .replace(/٫/g, '.').replace(/٬/g, ',').replace(/[   ]/g, ' ');
+  }
+  // все числа, которые можно прочитать в строке (соседний текст на любом языке игнорируется);
+  // если разделитель неоднозначен («1.200» — 1,2 или 1200), возвращаются оба варианта
+  function sumCands(v, strict, dec3) {          // dec3: иорданский динар (Orange Money, JOD) — три цифры после точки это доли: 20.000 = 20
+    const base = asciiDigits(v);
+    const out = new Set();
+    const add = (n) => { if (isFinite(n)) out.add(Math.round(n * 1000) / 1000); };
+    const read = (str) => {
+      [...str.matchAll(/\d[\d.,]*/g)].forEach((m) => {
+        const tok = m[0].replace(/[.,]+$/, '');
+        if (!tok) return;
+        if (strict) {                                                  // «отдельное число»: не часть даты, времени, телефона, номера через - / :
+          const prev = str[m.index - 1] || '', next = str[m.index + tok.length] || '', after = str[m.index + tok.length + 1] || '';
+          if (/[\-\/:@#]/.test(prev) && /\d/.test(str[m.index - 2] || '')) return;       // «_» не считаем: «Asiacell_5000» — номинал карты
+          if (/[\-\/:@#_]/.test(next) && /\d/.test(after)) return;
+          const cur = /^(JOD|EGP|USD|EUR|GBP|SAR|AED|KWD|QAR|BHD|OMR|LYD|DZD|MAD|TND|IQD|LBP|SYP|YER|SDG|TRY|PKR|INR|RUB|KZT|UZS|AZN|ILS|NGN)$/i;   // «JOD30.000» — сумма с кодом валюты, не код
+          const curBefore = cur.test(str.slice(Math.max(0, m.index - 3), m.index)) && !/[A-Za-z0-9_]/.test(str[m.index - 4] || '');
+          const curAfter = cur.test(str.slice(m.index + tok.length, m.index + tok.length + 3)) && !/[A-Za-z0-9_]/.test(str[m.index + tok.length + 3] || '');
+          if (!curBefore && !curAfter && /[A-Za-z_]/.test(prev) && /\d/.test(tok[0]) && /[A-Za-z0-9]/.test(prev)) return;    // «ref20», «TX20» — часть кода
+        }
+        const lc = tok.lastIndexOf(','), ld = tok.lastIndexOf('.');
+        if (lc >= 0 && ld >= 0) {                                    // оба разделителя: последний — десятичный
+          add(lc > ld ? parseFloat(tok.replace(/\./g, '').replace(',', '.')) : parseFloat(tok.replace(/,/g, '')));
+        } else if (lc >= 0 || ld >= 0) {
+          const sep = lc >= 0 ? ',' : '.';
+          const parts = tok.split(sep);
+          const last = parts[parts.length - 1];
+          if (parts.length > 2) add(parseFloat(parts.join('')));       // 1,200,000 — тысячи
+          else if (last.length === 3) { add(parseFloat(parts[0] + '.' + last)); if (!dec3) add(parseFloat(parts[0] + last)); }   // «5.000»: 5 или 5000
+          else add(parseFloat(parts[0] + '.' + last));
+        } else {
+          add(parseFloat(tok));
+          // OCR часто теряет десятичный разделитель: «94.00» → «9400», «94.0» → «940»
+          if (/^\d{3,9}$/.test(tok)) {
+            if (/000$/.test(tok)) add(parseFloat(tok) / 1000);          // «349.00» → «349000» (точка прочиталась как ноль)
+            if (/00$/.test(tok)) add(parseFloat(tok) / 100);
+            if (/0$/.test(tok)) add(parseFloat(tok) / 10);
+          }
+        }
+      });
+    };
+    read(base);
+    read(base.replace(/(?<=\d) (?=\d{3}(?!\d))/g, ''));              // «1 200» — тысячи через пробел
+    return [...out];
+  }
+  const parseSum = (v) => { const c = sumCands(v); return c.length ? c[0] : NaN; };
+  const alnum = (x) => String(x == null ? '' : x).toLowerCase().replace(/[^a-z0-9]/g, '');
+  // receiver с маской («**** 5021») → видимая часть; не похоже на номер (например название банка) → '' (не сравниваем)
+  function visibleTail(recv) {
+    const parts = String(recv || '').split(/[*xX•]+/).map(alnum).filter(Boolean);
+    const vis = parts.sort((a, b) => b.length - a.length)[0] || '';
+    return /\d{4,}/.test(vis) ? vis : '';
+  }
+  const walletHit = (vis, w) => { w = alnum(w); return !!vis && !!w && (w.endsWith(vis) || w.startsWith(vis) || (vis.length >= 6 && w.includes(vis))); };
+  function analyzeShots(entries) {
+    const newest = entries.slice().sort((a, b) => String(b.date).localeCompare(String(a.date)))[0] || {};
+    const amount = parseSum(newest.amount);
+    const seen = new Map();
+    entries.forEach((e) => (e.soc || []).forEach((o) => {
+      const key = o.documents_user || o.documents_support || JSON.stringify(o).slice(0, 120);
+      if (!seen.has(key)) seen.set(key, o);
+    }));
+    const all = [...seen.values()];
+    // чеки с ошибкой распознавания считаем нечитаемыми и не учитываем
+    const recs = all.filter((o) => o.classification === 'receipt' && o.extracted_data && typeof o.extracted_data === 'object' && !o.error_message);
+    const sh = { n: all.length, m: recs.length, amount: newest.amount == null ? '' : String(newest.amount), agentW: newest.agentW == null ? '' : String(newest.agentW),
+      sums: recs.map((o) => String(o.extracted_data.sum == null ? '' : o.extracted_data.sum)), recv: recs.map((o) => String(o.extracted_data.receiver || '')),
+      sumRes: 'none', walletRes: 'none', reasons: all.map((o) => o.rejection_reason).filter(Boolean).join(' | ') };
+    if (!recs.length) return sh;
+    // осторожное правило: «не сошлось» ставим только при однозначном расхождении, любые сомнения → 'unknown' (тикет не отмечается)
+    const sums = recs.map((o) => sumCands(o.extracted_data.sum));
+    // поиск суммы тикета как отдельного числа в остальном тексте чека (кроме даты, времени, номера операции, получателя, банка)
+    const SKIP = /^(date|time|utn|receiver|bank|status|period_start|period_end|currency)$/i;
+    const textOf = (o) => [...Object.entries(o.extracted_data).filter(([k]) => !SKIP.test(k) && k !== 'sum').map(([, v]) => v),
+      ...Object.entries(o).filter(([k, v]) => /(ocr|raw|text|content)/i.test(k) && typeof v === 'string').map(([, v]) => v)].filter((v) => typeof v === 'string' || typeof v === 'number').join(' \n ');
+    const standalone = recs.map((o) => sumCands(textOf(o), true));
+    sh.found = '';
+    const sumHit = recs.some((o, k) => {
+      if (!isNaN(amount) && sums[k].some((x) => Math.abs(x - amount) < 0.005)) { sh.found = 'поле суммы'; return true; }
+      if (!isNaN(amount) && standalone[k].some((x) => Math.abs(x - amount) < 0.005)) { sh.found = 'отдельное число в тексте чека'; return true; }
+      if (o.field_matches && o.field_matches.sum_match === '1') { sh.found = 'сайт (sum_match)'; return true; }
+      return false;
+    });
+    if (sumHit) sh.sumRes = 'ok';
+    else if (isNaN(amount) || amount <= 0 || sums.some((x) => !x.length)) sh.sumRes = 'unknown';
+    else sh.sumRes = 'bad';
+    const vis = recs.map((o) => visibleTail(o.extracted_data.receiver));
+    const agentW = alnum(newest.agentW), userW = alnum(newest.userW);
+    if (vis.some((v) => v && walletHit(v, agentW))) sh.walletRes = 'ok';
+    else if (!agentW || vis.some((v) => !v)) sh.walletRes = 'unknown';        // нет кошелька в тикете или получатель на каком-то чеке не читается
+    else if (userW && vis.some((v) => walletHit(v, userW))) sh.walletRes = 'user';
+    else sh.walletRes = 'bad';
+    return sh;
+  }
+  // ---------- распознавание самой картинки (второй проход, только для спорных тикетов) ----------
+  // данные сайта по чекам ненадёжны (берёт баланс вместо суммы, номер операции вместо кошелька), поэтому «не сошлось» ставим,
+  // только если распознавание картинки тоже не нашло сумму тикета / кошелёк агента
+  const TESS_SRC = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';
+  const ocrWorkers = {};   // lang -> Promise<worker>
+  const loadScript = (src) => new Promise((ok, no) => {
+    const sc = document.createElement('script');
+    sc.src = src; sc.onload = ok;
+    sc.onerror = () => no(new Error('не удалось загрузить библиотеку распознавания (возможно, запрещено политикой безопасности сайта)'));
+    document.head.appendChild(sc);
+  });
+  function getOcr(lang) {
+    if (!ocrWorkers[lang]) {
+      ocrWorkers[lang] = (async () => {
+        if (!PW.Tesseract) await loadScript(TESS_SRC);
+        if (!PW.Tesseract) throw new Error('библиотека распознавания не загрузилась');
+        const w = await PW.Tesseract.createWorker(lang);
+        await w.setParameters({ tessedit_pageseg_mode: '11' });   // разреженный текст: ищем все надписи на картинке
+        return w;
+      })().catch((e) => { delete ocrWorkers[lang]; if (lang === 'eng') e.fatal = true; throw e; });
+    }
+    return ocrWorkers[lang];
+  }
+  function gmBlob(url) {
+    return new Promise((ok, no) => {
+      if (typeof GM_xmlhttpRequest !== 'function') { fetch(url, { credentials: 'include' }).then((r) => (r.ok ? r.blob() : Promise.reject(new Error('HTTP ' + r.status)))).then(ok, no); return; }
+      GM_xmlhttpRequest({
+        method: 'GET', url, responseType: 'blob', timeout: 30000,
+        onload: (r) => (r.status >= 200 && r.status < 300 ? ok(r.response) : no(new Error('HTTP ' + r.status))),
+        onerror: () => no(new Error('картинка не скачалась')), ontimeout: () => no(new Error('картинка не скачалась (таймаут)')),
+      });
+    });
+  }
+  // увеличиваем, переводим в градации серого, тёмные скрины инвертируем (так распознаётся заметно лучше)
+  async function prepImage(blob) {
+    const bmp = await createImageBitmap(blob);
+    const scale = Math.max(1, Math.min(4, 1200 / bmp.width, 6000 / bmp.height));
+    const c = document.createElement('canvas');
+    c.width = Math.round(bmp.width * scale); c.height = Math.round(bmp.height * scale);
+    const g = c.getContext('2d');
+    g.imageSmoothingQuality = 'high';
+    g.drawImage(bmp, 0, 0, c.width, c.height);
+    const d = g.getImageData(0, 0, c.width, c.height), px = d.data;
+    let total = 0;
+    for (let k = 0; k < px.length; k += 4) { const l = 0.299 * px[k] + 0.587 * px[k + 1] + 0.114 * px[k + 2]; px[k] = px[k + 1] = px[k + 2] = l; total += l; }
+    if (total / (px.length / 4) < 110) for (let k = 0; k < px.length; k += 4) px[k] = px[k + 1] = px[k + 2] = 255 - px[k];
+    g.putImageData(d, 0, 0);
+    return c;
+  }
+  async function loadCanvas(url) {
+    const blob = await gmBlob(url);
+    if (!blob || !/^image\//.test(blob.type || '')) throw new Error('по ссылке не картинка (' + ((blob && blob.type) || 'нет типа') + ')');
+    return prepImage(blob);
+  }
+  async function ocrCanvas(canvas, lang) {
+    const w = await getOcr(lang);
+    const r = await w.recognize(canvas);
+    return { text: (r && r.data && r.data.text) || '', conf: (r && r.data && r.data.confidence) || 0 };
+  }
+  // ---------- Google Cloud Vision (если задан ключ): читает арабские и персидские цифры, длинные скриншоты — целиком ----------
+  const GVISION = 'https://vision.googleapis.com/v1/images:annotate';
+  const blobB64 = (blob) => new Promise((ok, no) => {
+    const fr = new FileReader();
+    fr.onload = () => ok(String(fr.result).split(',')[1] || '');
+    fr.onerror = () => no(new Error('не удалось прочитать файл картинки'));
+    fr.readAsDataURL(blob);
+  });
+  async function visionText(blob) {
+    if (blob.size > 9.5 * 1024 * 1024) throw new Error('картинка больше 10 МБ — Google Vision её не примет');
+    const content = await blobB64(blob);
+    const body = JSON.stringify({ requests: [{ image: { content }, features: [{ type: 'DOCUMENT_TEXT_DETECTION' }], imageContext: { languageHints: ['ar', 'fa', 'en'] } }] });
+    const url = GVISION + '?key=' + encodeURIComponent(S.gkey);
+    const resp = await new Promise((ok, no) => {
+      const done = (status, text) => { try { ok({ status, json: JSON.parse(text) }); } catch (e) { no(new Error('ответ Google не JSON (HTTP ' + status + ')')); } };
+      if (typeof GM_xmlhttpRequest === 'function') {
+        GM_xmlhttpRequest({ method: 'POST', url, headers: { 'Content-Type': 'application/json' }, data: body, timeout: 40000,
+          onload: (r) => done(r.status, r.responseText), onerror: () => no(new Error('нет связи с Google Vision')), ontimeout: () => no(new Error('Google Vision: таймаут')) });
+      } else {
+        fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body }).then((r) => r.text().then((t) => done(r.status, t)), () => no(new Error('нет связи с Google Vision')));
+      }
+    });
+    const j = resp.json || {};
+    if (j.error) { const e = new Error('Google Vision: ' + (j.error.message || ('HTTP ' + resp.status))); e.fatal = true; throw e; }   // неверный ключ, не включён API, нет квоты — дальше пробовать бессмысленно
+    const r0 = (j.responses || [])[0];
+    if (!r0) throw new Error('Google Vision: пустой ответ');
+    if (r0.error) throw new Error('Google Vision: ' + (r0.error.message || 'ошибка'));
+    const fta = r0.fullTextAnnotation;
+    const page = fta && fta.pages && fta.pages[0];
+    return { text: (fta && fta.text) || '', conf: page && typeof page.confidence === 'number' ? page.confidence * 100 : (fta && fta.text ? 80 : 0) };
+  }
+  // ---------- Google Apps Script (распознавание через Google Drive): картинка уходит на ваш скрипт, обратно приходит текст ----------
+  // Drive OCR не принимает большие файлы («Request Too Large»): тяжёлые фото уменьшаем и пережимаем в JPEG
+  async function shrinkBlob(blob, maxBytes) {
+    if (blob.size <= maxBytes || !/^image\//.test(blob.type || '')) return blob;            // PDF не пережимаем
+    const bmp = await createImageBitmap(blob);
+    let scale = Math.min(1, 2200 / Math.max(bmp.width, bmp.height));
+    for (let a = 0; a < 5; a++) {
+      const c = document.createElement('canvas');
+      c.width = Math.max(1, Math.round(bmp.width * scale)); c.height = Math.max(1, Math.round(bmp.height * scale));
+      const g = c.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height); g.drawImage(bmp, 0, 0, c.width, c.height);
+      const out = await new Promise((ok) => c.toBlob(ok, 'image/jpeg', a < 2 ? 0.85 : 0.7));
+      if (out && out.size <= maxBytes) return out;
+      scale *= 0.75;
+    }
+    throw Object.assign(new Error('картинка слишком большая для распознавания'), { fatal: false });
+  }
+  // адресов Apps Script может быть несколько (через пробел, запятую или с новой строки; секретное слово у всех одно): нагрузка делится по кругу,
+  // если один адрес падает или упёрся в лимит — запрос сразу уходит на другой, а упавший на время откладывается
+  const gUrls = () => String(S.gurl || '').split(/[\s,;]+/).map((u) => u.replace(/^[\s"'`]+|[\s"'`]+$/g, '')).filter(Boolean);
+  const gU = {};
+  let gRR = 0;
+  const dayKey = () => 'ts_gcalls_' + new Date().toISOString().slice(0, 10);
+  function countCall(idx) {
+    try { const k = dayKey(); const o = JSON.parse(localStorage.getItem(k) || '{}'); o[idx] = (o[idx] || 0) + 1; localStorage.setItem(k, JSON.stringify(o)); } catch (e) { /* счётчик не обязателен */ }
+  }
+  function callsToday() {
+    try { return JSON.parse(localStorage.getItem(dayKey()) || '{}'); } catch (e) { return {}; }
+  }
+  async function appsScriptText(blob) {
+    blob = await shrinkBlob(blob, 1500000);
+    const image = await blobB64(blob);
+    const body = JSON.stringify({ secret: S.gsecret, mime: blob.type || 'image/jpeg', image });
+    const urls = gUrls();
+    const n = urls.length;
+    if (!n) throw Object.assign(new Error('адрес Apps Script не задан'), { fatal: true });
+    const start = gRR++ % n, now = Date.now();
+    const order = urls.map((u, i) => ({ u, i })).map((_, k, a) => a[(start + k) % n]);
+    const alive = order.filter((o) => !(gU[o.u] && gU[o.u].downUntil > now));
+    let lastE;
+    for (const o of (alive.length ? alive : order)) {
+      const g = gU[o.u] || (gU[o.u] = { ok: 0, err: 0, fails: 0, downUntil: 0 });
+      try {
+        const r = await appsScriptOnce(o.u, body);
+        g.ok++; g.fails = 0; g.downUntil = 0; countCall(o.i);
+        return r;
+      } catch (e) {
+        lastE = e; g.err++; g.fails++;
+        const quota = /too many times|quota|limit exceeded|rate limit/i.test(e.message || '');
+        if (g.fails >= 2 || quota) g.downUntil = Date.now() + (quota ? 600000 : 60000);
+        if (n === 1) throw e;
+      }
+    }
+    throw lastE;
+  }
+  async function appsScriptOnce(url, body) {
+    const resp = await new Promise((ok, no) => {
+      const done = (status, text) => {
+        try { ok(JSON.parse(text)); } catch (e) { no(Object.assign(new Error('Apps Script вернул не JSON (HTTP ' + status + '). Проверьте, что приложение развёрнуто как «Веб-приложение» с доступом «Все» и адрес заканчивается на /exec'), { fatal: !(status === 429 || status >= 500 || /too many|try again|rate limit|overload|временно|unavailable/i.test(String(text).slice(0, 3000))) })); }
+      };
+      if (typeof GM_xmlhttpRequest === 'function') {
+        GM_xmlhttpRequest({ method: 'POST', url, headers: { 'Content-Type': 'text/plain;charset=UTF-8' }, data: body, timeout: 90000,
+          onload: (r) => done(r.status, r.responseText), onerror: () => no(new Error('нет связи с Apps Script')), ontimeout: () => no(new Error('Apps Script: таймаут')) });
+      } else {
+        fetch(url, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=UTF-8' }, body }).then((r) => r.text().then((t) => done(r.status, t)), () => no(new Error('нет связи с Apps Script')));
+      }
+    });
+    if (!resp.ok) throw Object.assign(new Error('Apps Script: ' + (resp.error || 'ошибка')), { fatal: !!resp.fatal || (!/too many|too large|rate limit|limit exceeded|quota|try again|unavailable|timed? ?out|overload|temporar/i.test(resp.error || '') && /Drive|permission|авториз|authoriz|scope|not found.*service/i.test(resp.error || '')) });
+    return { text: resp.text || '', conf: resp.text ? 70 : 0 };     // Google Drive не отдаёт уверенность — считаем текст по наличию чисел
+  }
+  // единая точка распознавания: Google Vision, если задан ключ, иначе английская модель в браузере
+  // кэш прочитанных картинок: одну и ту же картинку Google повторно не читаем (экономит лимит и время; хранится в браузере, до 400 записей)
+  const CACHE_KEY = 'ts_ocr_cache_v1';
+  const gS = { ok: 0, err: 0, cache: 0, last: '', lastErrAt: 0, lastOkAt: 0 };
+  const ocrCache = (() => {
+    let m = new Map();
+    try { m = new Map(JSON.parse(localStorage.getItem(CACHE_KEY) || '[]')); } catch (e) { /* кэш не обязателен */ }
+    let t = 0;
+    const save = () => { clearTimeout(t); t = setTimeout(() => { try { localStorage.setItem(CACHE_KEY, JSON.stringify([...m].slice(-400))); } catch (e) { /* переполнено — не страшно */ } }, 1500); };
+    return {
+      get: (k) => m.get(k),
+      has: (k) => m.has(k),
+      set: (k, v) => { m.delete(k); m.set(k, v); if (m.size > 400) m.delete(m.keys().next().value); save(); },
+      clear: () => { m.clear(); try { localStorage.removeItem(CACHE_KEY); } catch (e) { /* ignore */ } },
+      size: () => m.size,
+    };
+  })();
+  function paintG() {
+    const el = document.getElementById('ts-gs');
+    if (!el) return;
+    const bad = gS.lastErrAt > gS.lastOkAt && Date.now() - gS.lastErrAt < 90000;
+    el.style.color = bad ? '#cf1322' : '#555';
+    el.textContent = bad
+      ? `⚠ Google отвечает с ошибками (${String(gS.last).slice(0, 90)}) — жду и повторяю`
+      : `Google: прочитано ${gS.ok}, из кэша ${gS.cache}${gS.err ? ', ошибок ' + gS.err : ''}` + (() => {
+        const c = callsToday(), tot = Object.values(c).reduce((a, b) => a + b, 0), us = gUrls();
+        const down = us.filter((u) => gU[u] && gU[u].downUntil > Date.now()).length;
+        return ` · запросов сегодня: ${tot}` + (us.length > 1 ? ` (скриптов ${us.length}: ${us.map((_, i) => c[i] || 0).join(' / ')}${down ? ', временно отключено ' + down : ''})` : '');
+      })();
+  }
+  async function recognizeUrl(url, opts) {                                  // с повторами: при нагрузке Google иногда отвечает ошибкой/таймаутом
+    const ckey = (S.gurl ? 'g|' : S.gkey ? 'v|' : 't|') + url + (opts && opts.invert ? '|inv' : '') + (opts && opts.enhance ? '|enh' : '');
+    if (ocrCache.has(ckey)) { gS.cache++; paintG(); return ocrCache.get(ckey); }
+    let last;
+    for (let a = 0; a < 4; a++) {
+      try { const r = await recognizeOnce(url, opts); if (r === null || (r && r.text !== undefined)) { ocrCache.set(ckey, r); } gS.ok++; gS.lastOkAt = Date.now(); paintG(); return r; } catch (e) {
+        last = e; gErr++; gS.err++; gS.last = e.message || String(e); gS.lastErrAt = Date.now(); paintG();
+        if (e.fatal || /не картинка|too large|слишком больш/i.test(e.message || '')) throw e;
+        await sleep(2000 * Math.pow(2, a) + Math.random() * 1000);
+      }
+    }
+    throw last;
+  }
+  // третий проход для плохих фото (экран телефона снят издали, размыт, с бликами): вырезаем область с текстом, увеличиваем, выравниваем контраст, слегка повышаем резкость.
+  // Тёмный экран со светлым текстом после этого становится тёмным текстом на светлом. Если область найти не удалось — обрабатывается вся картинка.
+  async function enhanceBlob(blob) {
+    if (!/^image\//.test(blob.type || '')) return null;
+    const bmp = await createImageBitmap(blob);
+    const W = bmp.width, H = bmp.height;
+    // 1) область с текстом: на маленькой копии считаем «плотность перепадов яркости» по строкам и столбцам
+    const sw = 160, sh = Math.max(8, Math.round(160 * H / W));
+    const c0 = document.createElement('canvas'); c0.width = sw; c0.height = sh;
+    const g0 = c0.getContext('2d'); g0.drawImage(bmp, 0, 0, sw, sh);
+    const d0 = g0.getImageData(0, 0, sw, sh).data;
+    const L = (i) => 0.299 * d0[i] + 0.587 * d0[i + 1] + 0.114 * d0[i + 2];
+    const rowD = new Float32Array(sh), colD = new Float32Array(sw);
+    for (let y = 0; y < sh - 1; y++) for (let x = 0; x < sw - 1; x++) {
+      const i = (y * sw + x) * 4, e = Math.abs(L(i) - L(i + 4)) + Math.abs(L(i) - L(i + sw * 4));
+      rowD[y] += e; colD[x] += e;
+    }
+    const span = (arr) => {
+      const mx = Math.max(...arr), th = mx * 0.3;
+      const a = arr.findIndex((v) => v >= th), b = arr.length - 1 - [...arr].reverse().findIndex((v) => v >= th);
+      return [a < 0 ? 0 : a, b < 0 ? arr.length - 1 : b];
+    };
+    let [x0, x1] = span(colD), [y0, y1] = span(rowD);
+    const padX = Math.round(sw * 0.05), padY = Math.round(sh * 0.05);
+    x0 = Math.max(0, x0 - padX); x1 = Math.min(sw - 1, x1 + padX); y0 = Math.max(0, y0 - padY); y1 = Math.min(sh - 1, y1 + padY);
+    const frac = ((x1 - x0 + 1) * (y1 - y0 + 1)) / (sw * sh);
+    let sx = 0, sy = 0, cw = W, ch = H;
+    if (frac >= 0.2 && frac <= 0.9) { sx = Math.round(x0 / sw * W); sy = Math.round(y0 / sh * H); cw = Math.round((x1 - x0 + 1) / sw * W); ch = Math.round((y1 - y0 + 1) / sh * H); }
+    // 2) увеличиваем/уменьшаем до длинной стороны ≈ 2400
+    const sc = Math.min(3, 2400 / Math.max(cw, ch));
+    const w = Math.max(1, Math.round(cw * sc)), h = Math.max(1, Math.round(ch * sc));
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    const g = c.getContext('2d'); g.imageSmoothingQuality = 'high'; g.drawImage(bmp, sx, sy, cw, ch, 0, 0, w, h);
+    const im = g.getImageData(0, 0, w, h), d = im.data, n = w * h;
+    // 3) серый + растяжка контраста (2–98 процентиль)
+    const gray = new Uint8ClampedArray(n), hist = new Uint32Array(256);
+    for (let i = 0, p = 0; i < n; i++, p += 4) { const v = (0.299 * d[p] + 0.587 * d[p + 1] + 0.114 * d[p + 2]) | 0; gray[i] = v; hist[v]++; }
+    let acc = 0, lo = 0, hi = 255;
+    for (let v = 0; v < 256; v++) { acc += hist[v]; if (acc >= n * 0.02) { lo = v; break; } }
+    acc = 0;
+    for (let v = 255; v >= 0; v--) { acc += hist[v]; if (acc >= n * 0.02) { hi = v; break; } }
+    if (hi - lo < 30) { lo = 0; hi = 255; }
+    let mean = 0;
+    for (let i = 0; i < n; i++) { const v = Math.max(0, Math.min(255, ((gray[i] - lo) * 255) / (hi - lo))); gray[i] = v; mean += v; }
+    mean /= n;
+    if (mean < 110) for (let i = 0; i < n; i++) gray[i] = 255 - gray[i];                 // тёмный экран → светлый фон
+    // 4) мягкая резкость (ядро 3×3)
+    const out = new Uint8ClampedArray(n);
+    for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+      const i = y * w + x;
+      out[i] = 5 * gray[i] - gray[i - 1] - gray[i + 1] - gray[i - w] - gray[i + w];
+    }
+    for (let i = 0, p = 0; i < n; i++, p += 4) { const v = out[i] || gray[i]; d[p] = d[p + 1] = d[p + 2] = v; d[p + 3] = 255; }
+    g.putImageData(im, 0, 0);
+    return await new Promise((ok) => c.toBlob(ok, 'image/jpeg', 0.9));
+  }
+  // тёмный скрин со светлым текстом → инвертируем (Google читает такие хуже); светлый — вернёт null
+  async function invertIfDark(blob) {
+    if (!/^image\//.test(blob.type || '')) return null;
+    const bmp = await createImageBitmap(blob);
+    const sc = Math.min(1, 2200 / Math.max(bmp.width, bmp.height)), w = Math.max(1, Math.round(bmp.width * sc)), h = Math.max(1, Math.round(bmp.height * sc));
+    const c = document.createElement('canvas'); c.width = w; c.height = h;
+    const g = c.getContext('2d'); g.drawImage(bmp, 0, 0, w, h);
+    const im = g.getImageData(0, 0, w, h), d = im.data;
+    let sum = 0, cnt = 0;
+    for (let i = 0; i < d.length; i += 64) { sum += 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]; cnt++; }
+    if (sum / cnt >= 120) return null;
+    for (let i = 0; i < d.length; i += 4) { const y = 255 - (0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]); d[i] = d[i + 1] = d[i + 2] = y; }
+    g.putImageData(im, 0, 0);
+    const out = await new Promise((ok) => c.toBlob(ok, 'image/jpeg', 0.9));
+    return out ? shrinkBlob(out, 1500000) : null;
+  }
+  async function recognizeOnce(url, opts) {
+    let blob = await gmBlob(url);
+    const isPdf = !!blob && /pdf/i.test(blob.type || '');
+    if (!blob || !(/^image\//.test(blob.type || '') || (isPdf && S.gurl))) throw new Error('по ссылке не картинка (' + ((blob && blob.type) || 'нет типа') + ')');   // PDF-выписки читает только Google (Apps Script)
+    if (opts && opts.invert) { if (!S.gurl) return null; blob = await invertIfDark(blob); if (!blob) return null; }
+    if (opts && opts.enhance) { if (!S.gurl) return null; blob = await enhanceBlob(blob); if (!blob) return null; }
+    if (S.gurl) { const o = await appsScriptText(blob); o.engine = 'apps-script'; o.bytes = blob.size; return o; }
+    if (S.gkey) { const o = await visionText(blob); o.engine = 'google'; o.bytes = blob.size; return o; }
+    const o = await ocrCanvas(await prepImage(blob), 'eng');
+    o.engine = 'tesseract'; o.bytes = blob.size;
+    return o;
+  }
+  // текст считаем прочитанным, только если уверенность распознавания не низкая и в нём есть хотя бы два числа из 2+ цифр
+  // сколько в тексте «возможных сумм» (чисел), если убрать время, даты, проценты, индикаторы сети и длинные номера (телефоны, номера операций)
+  const bareNums = (text) => {
+    const t = arNorm(asciiDigits(String(text || '')))
+      .replace(/\d{1,2}:\d{2}(?::\d{2})?/g, ' ')
+      .replace(/\d{1,4}[\/.\-]\d{1,2}[\/.\-]\d{1,4}/g, ' ')
+      .replace(/\d{1,2}\s*(?:يناير|فبراير|مارس|ابريل|مايو|يونيو|يوليو|اغسطس|سبتمبر|اكتوبر|نوفمبر|ديسمبر|janv|f[ée]vr|mars|avr|mai|juin|juil|ao[uû]t|sept|oct|nov|d[ée]c|jan|feb|mar|apr|may|jun|jul|aug|sep|dec)[^\s\d]*\.?\s*,?\s*\d{0,4}/gi, ' ')
+      .replace(/%\s*\d+|\d+\s*%/g, ' ')
+      .replace(/\d+\s*G\b|LTE\s*\d*|\bVo\)*\s*\d*/gi, ' ')
+      .replace(/\d{7,}/g, ' ');
+    return (t.match(/\d+(?:[.,]\d+)?/g) || []).length;
+  };
+  const readable = (o) => o.conf >= 50 && (asciiDigits(o.text).match(/\d{2,}/g) || []).length >= 2;
+  // Скриншот формы пополнения (поле суммы, «минимум/максимум», «загрузите скриншот»), а не чек подтверждения — такие картинки игнорируем
+  const arNorm = (t) => String(t || '').replace(/[\u064B-\u065F\u0670\u0640]/g, '').replace(/[أإآ]/g, 'ا').replace(/ى/g, 'ي').replace(/ة/g, 'ه').replace(/[ؤئ]/g, 'و');
+  const FORM_MARKS = [
+    /الحد\s*ال(ا?دن|ا?قص)/,                                   // «الحد الأدنى / الحد الأقصى»
+    /سكرين|اسكرين|screenshot/i,                                // «السكرين شوت»
+    /\.(jpg|jpeg|png|pdf)\b/i,                                // форматы файлов
+    /ميغا\s*بايت|ميجا\s*بايت|\bMB\b/,                          // «максимальный размер файла»
+    /اكتب\s*رقمك|ارسلت\s*منه|قم\s*بتحويل\s*الاموال|انشاء\s*طلب/, // подсказки формы
+    /min(imum)?\s*(limit|amount|deposit)|max(imum)?\s*(limit|amount)|upload\s*(the\s*)?(screenshot|receipt)/i
+  ];
+  // суммы из фраз подтверждения перевода («تم تحويل 115 جنيه»): если форма пополнения перекрыта настоящим SMS, берём только их
+  const confirmedAmounts = (text) => {
+    const t = arNorm(asciiDigits(text)), out = [];
+    for (const m of t.matchAll(/(?:تم\s*تحويل|تم\s*الدفع|تم\s*ايداع|تمت\s*عمليه\s*التحويل\s*الماليه?[^\d]{0,40}بمبلغ)\s*(?:مبلغ\s*)?(\d[\d.,]*)/gi)) out.push(m[1].replace(/[.,]+$/, ''));
+    return out;
+  };
+  const isFormShot = (text) => { const t = arNorm(asciiDigits(text)); return FORM_MARKS.filter((re) => re.test(t)).length >= 2; };
+  async function ocrCheckRow(res, links) {
+    const out = { ok: false, amtSeen: false, noAmount: false, sumFound: false, walletFound: false, sums: [], siteSeen: false, repeat: false, longNum: false, n: 0, forms: 0, onlyForms: false, err: '', text: '', fatal: false };
+    const amount = parseSum(res.shot.amount);
+    // сумма с комиссией: на чеке есть итог T и небольшая комиссия F (до 15%), и T − F или T + F равно сумме тикета (24.50 − 0.50 = 24)
+    const withFee = (nums, amt) => {
+      if (!(amt > 0)) return false;
+      const u = [...new Set(nums.filter((x) => x > 0 && x < 1e7))].slice(0, 60);
+      return u.some((t) => u.some((f) => f !== t && f <= 0.15 * Math.max(t, amt) && (Math.abs(t - f - amt) < 0.005 || Math.abs(t + f - amt) < 0.005)));
+    };
+    const siteC = (res.shot.sums || []).flatMap((x) => sumCands(x)).filter((c) => c > 0);          // сумма сайта 0.00 — мусор, не подтверждение
+    const fuzzyHas = (hay, needle) => {                              // допускаем потерянные/неверные символы (до 2 для длинных кошельков): HHHOU856 ≈ HHH856
+      const m = needle.length, maxD = m >= 8 ? 2 : 1;
+      let prev = Array.from({ length: m + 1 }, (_, k) => k);
+      for (let t = 0; t < hay.length; t++) {
+        const cur = [0];
+        for (let k = 1; k <= m; k++) cur[k] = Math.min(prev[k] + 1, cur[k - 1] + 1, prev[k - 1] + (needle[k - 1] === hay[t] ? 0 : 1));
+        if (cur[m] <= maxD) return true;
+        prev = cur;
+      }
+      return false;
+    };
+    // trusted — текст прочитан уверенно. Найденное совпадение (сумма тикета, кошелёк агента) засчитываем из ЛЮБОГО прохода,
+    // а «подтверждающие» признаки для отметки (сумма сайта на картинке, длинный номер) — только из уверенно прочитанного текста
+    const scan = (text, trusted) => {
+      const jod = /orange\s*money|\bJOD\b|الأردن|الاردن|اردني|أردني|اورنج\s*موني/i.test(text);       // иорданский чек: 20.000 = 20, а не 20000
+      const nums = sumCands(text, true, jod);
+      // итог чека чуть больше суммы тикета (комиссия до 2%), а сама комиссия не прочиталась, но на чеке есть слова «Комиссия/Итого»: 200 → 201
+      const feeWords = /الرسوم|الاجمالي|العمولة|المصاريف|\b(fee|fees|commission|total)\b/i.test(arNorm(asciiDigits(text)));
+      const softFee = (n) => amount >= 10 && feeWords && n.some((x) => x > amount && x - amount <= Math.max(1, 0.02 * amount));
+      if (!isNaN(amount) && (nums.some((x) => Math.abs(x - amount) < 0.005) || withFee(nums, amount) || softFee(nums))) out.sumFound = true;
+      // числа после слов «комиссия / остаток / رسوم / رصيد» — это комиссия или остаток, ими сумму сайта не подтверждаем
+      const feeV = [];
+      for (const m of arNorm(asciiDigits(text)).matchAll(/(?:مصاريف|رسوم|عموله|(?<!من\s)رصيد|fees?|commission|balance)[^\d]{0,30}(\d[\d.,]*)/gi)) feeV.push(...sumCands(m[1].replace(/[.,]+$/, ''), false, jod));
+      if (trusted && siteC.some((c) => nums.some((x) => !feeV.some((f) => Math.abs(f - x) < 0.005) && Math.abs(x - c) < 0.005))) out.siteSeen = true;     // картинка подтверждает ту сумму, которую назвал сайт
+      { // суммы, прочитанные Google (числа рядом со словом валюты) — для отчёта
+        const CUR2 = '(?:جنيه|جنيها|دينار|ريال|درهم|EGP|JOD|SAR|AED|USD|IQD|MAD|LE|(?<![\\u0600-\\u06FF])د(?![\\u0600-\\u06FF]))', at2 = asciiDigits(text);
+        for (const m of at2.matchAll(new RegExp('(\\d[\\d.,]*)\\s*[-–]?\\s*' + CUR2 + '|' + CUR2 + '\\s*(\\d[\\d.,]*)', 'gi'))) {
+          const cs = sumCands((m[1] || m[2]).replace(/[.,]+$/, ''), false, jod).filter((x) => x > 0), v = jod ? cs[0] : Math.max(0, ...cs);       // «10,000» вне Иордании — 10000, а не 10
+          if (v > 0 && !out.sums.includes(v) && !feeV.some((f) => Math.abs(f - v) < 0.005)) out.sums.push(v);
+        }
+      }
+      // чёткий чек: одна и та же сумма с валютой («٢١٠٠ جنيه» в заголовке и в «Итого») стоит на картинке минимум дважды
+      if (trusted) {
+        const at = asciiDigits(text), CUR = '(?:جنيه|جنيها|دينار|ريال|درهم|EGP|JOD|SAR|AED|USD|IQD|MAD|LE|(?<![\\u0600-\\u06FF])د(?![\\u0600-\\u06FF]))', cnt = {};
+        for (const m of at.matchAll(new RegExp('(\\d[\\d.,]*)\\s*[-–]?\\s*' + CUR + '|' + CUR + '\\s*(\\d[\\d.,]*)', 'gi'))) {
+          const cs = sumCands((m[1] || m[2]).replace(/[.,]+$/, ''), false, jod).filter((x) => x > 0), v = jod ? cs[0] : Math.max(0, ...cs);      // «284.00» и «284» — одна и та же сумма
+          if (!(v > 0) || feeV.some((f) => Math.abs(f - v) < 0.005)) continue;                       // остаток кошелька и комиссию не считаем
+          const k = String(v); cnt[k] = (cnt[k] || 0) + 1;
+        }
+        if (Object.values(cnt).some((c) => c >= 2)) out.repeat = true;
+        // сумма и итог с комиссией («150 جنيه» и «الإجمальي 151 جنيه»): два числа с валютой, разница — как комиссия, и на чеке есть слова про итог/комиссию
+        const vals = Object.keys(cnt).map((k) => sumCands(k)[0]).filter((x) => x > 0);
+        if (feeWords && vals.some((a) => vals.some((c) => c > a && c - a <= Math.max(1, 0.02 * a)))) out.repeat = true;
+      }
+      // явная фраза «на сумму / بمبلغ / Amount N + валюта»: одна такая сумма и нет слов про комиссию/итог — чек однозначно называет сумму перевода
+      if (trusted && !feeWords) {
+        const kv = new Set();
+        for (const m of asciiDigits(text).matchAll(/(?:بمبلغ|المبلغ|مبلغ|\bamount\b)[^\d]{0,40}?(\d[\d.,]*)\s*(?:جنيه|جنيها|دينار|ريال|درهم|EGP|JOD|SAR|AED|USD|LE|MAD)/gi)) { const v = sumCands(m[1].replace(/[.,]+$/, ''), false, jod)[0]; if (v > 0 && !feeV.some((f) => Math.abs(f - v) < 0.005)) kv.add(v); }
+        if (kv.size === 1) out.repeat = true;
+      }
+      if (trusted) { (out.curSeen = out.curSeen || []).push(...detectCur(text)); }
+      if (bareNums(text) > 0) out.amtSeen = true;                         // на картинке есть хоть что-то похожее на сумму
+      const dg = asciiDigits(text);
+      if (trusted && /\d{9,}/.test(dg)) out.longNum = true;                                                 // на картинке прочитан длинный номер (кошелёк / операция)
+    };
+    for (const href of links.slice(0, 5)) {
+      if (out.sumFound) break;                                           // сумма уже найдена — остальные картинки тикета не читаем
+      try {
+        const sums0 = out.sums.length;
+        let p1 = await recognizeUrl(new URL(href, location.origin).href);
+        let any;
+        if (isFormShot(p1.text)) {
+          const cs = confirmedAmounts(p1.text);
+          if (!cs.length) { out.forms++; continue; }                     // форма пополнения без подтверждения перевода — пропускаем
+          p1 = { text: cs.map((x) => 'تم تحويل ' + x + ' جنيه').join(' ... '), conf: 70 };   // форма + SMS поверх: читаем только сумму из SMS
+          any = true;
+        } else any = readable(p1);
+        scan(p1.text, any); out.text += ' ' + p1.text.replace(/\s+/g, ' ').trim().slice(0, 200);
+        if (!out.sumFound && S.gurl) {   // сумма тикета не найдена — пробуем инвертированную версию тёмного скрина
+          try {
+            const p2 = await recognizeUrl(new URL(href, location.origin).href, { invert: true });
+            if (p2 && p2.text && !isFormShot(p2.text)) { const a2 = readable(p2); scan(p2.text, a2); out.text += ' | инверсия: ' + p2.text.replace(/\s+/g, ' ').trim().slice(0, 150); any = any || a2; }
+          } catch (e2) { /* второй проход не обязателен */ }
+        }
+        if (!out.sumFound && S.gurl && (!any || out.sums.length === sums0)) {   // и после этого сумма не прочитана — третий проход: вырезаем экран, увеличиваем, усиливаем контраст
+          try {
+            const p3 = await recognizeUrl(new URL(href, location.origin).href, { enhance: true });
+            if (p3 && p3.text && !isFormShot(p3.text)) { const a3 = readable(p3); scan(p3.text, a3); out.text += ' | усиление: ' + p3.text.replace(/\s+/g, ' ').trim().slice(0, 150); any = any || a3; }
+          } catch (e3) { /* третий проход не обязателен */ }
+        }
+        if (any) { out.ok = true; out.n++; } else out.err = out.err || 'текст на картинке не распознан (низкая уверенность)';
+      } catch (e) { out.err = e.message; if (e.fatal) { out.fatal = true; break; } }
+    }
+    out.noAmount = !!(out.ok && !out.sumFound && !out.amtSeen && !out.sums.length && !out.err);      // чек прочитан, но суммы на нём нет вообще (обрезанный скрин)
+    if (!out.ok && !out.forms && !out.fatal && out.err && !/не распознан/.test(out.err)) out.retriable = true;   // сбой связи/нагрузки — перепроверим позже
+    if (!out.ok && out.forms && !out.err) out.onlyForms = true;       // на всех картинках только формы — проверять нечего
+    return out;
+  }
+  // ---------- валюта: чек ↔ тикет. Расхождение валюты НИКОГДА не даёт «не сошлось» — только «проверить вручную» с понятной причиной ----------
+  const CUR_NAMES = { 'египетский фунт': 'EGP', 'иорданский динар': 'JOD', 'иракский динар': 'IQD', 'марокканский дирхам': 'MAD', 'дирхам оаэ': 'AED', 'саудовский риал': 'SAR', 'доллар сша': 'USD',
+    'алжирский динар': 'DZD', 'тунисский динар': 'TND', 'кувейтский динар': 'KWD', 'бахрейнский динар': 'BHD', 'ливийский динар': 'LYD', 'катарский риал': 'QAR', 'оманский риал': 'OMR', 'йеменский риал': 'YER', 'турецкая лира': 'TRY', 'евро': 'EUR' };
+  const curCode = (v) => { const raw = String(v == null ? '' : v).trim(); const k = raw.toLowerCase().replace(/\([^)]*\)/g, '').replace(/\s+/g, ' ').trim(); return CUR_NAMES[k] || (/^[A-Za-z]{3,5}$/.test(raw) ? raw.toUpperCase().replace(/^([A-Z]{3})M$/, '$1') : ''); };      // «DZDM» (manual) → DZD
+  // что именно написано на чеке; каждое совпадение — список валют, которые это слово допускает («دينار» может быть иорданским, иракским, кувейтским…)
+  const RECV_CUR = [
+    [/جنيه|جنيها|\bEGP\b|ج\.\s*م|(?:\bLE\s*\d|\d\s*LE\b)/, ['EGP']],
+    [/دينار\s*ا?ردني|ا?ردني|\bJOD\b/i, ['JOD']],
+    [/\bIQD\b|عراقي|asiacell|اسياسيل|اسيا\s*سيل/i, ['IQD']],
+    [/\bDZD\b|\bDA\b|دج|جزايري|جزائري|dinar\s*alg/i, ['DZD']],
+    [/\bTND\b|\bDT\b|تونسي|dinar\s*tunis/i, ['TND']],
+    [/دينار/, ['JOD', 'IQD', 'KWD', 'BHD', 'DZD', 'TND', 'LYD', 'RSD']],
+    [/درهم|\bMAD\b|\bAED\b|dirham/i, ['MAD', 'AED']],
+    [/ريال|\bSAR\b|\bQAR\b|\bOMR\b|\bYER\b/i, ['SAR', 'QAR', 'OMR', 'YER', 'IRR']],
+    [/\bUSD\b|دولار|\$/, ['USD', 'USDT', 'USDC']],
+  ];
+  const detectCur = (text) => { const t = arNorm(String(text || '')); return RECV_CUR.filter(([re]) => re.test(t)).map(([, codes]) => codes); };
+  // true — на чеке есть валюта, но ни одна не подходит к валюте тикета
+  const curConflict = (r) => {
+    const tc = curCode(r && r.cur);
+    if (!tc || !r.ocr || !r.ocr.ok || !r.ocr.curSeen || !r.ocr.curSeen.length) return false;
+    return !r.ocr.curSeen.some((codes) => codes.includes(tc));
+  };
+  const curSeenText = (r) => [...new Set((r.ocr.curSeen || []).map((c) => c.slice(0, 3).join('/')))].join(' ; ');
+  const allMode = (r) => !!(S.all && S.ocr && S.gurl && r && r.shot && r.links && r.links.length);       // режим «читать все скриншоты»
+  const siteSuspect = (r) => !!r.shot && (r.shot.sumRes === 'bad' || allMode(r));
+  const ocrConfirmed = (r) => !!(S.ocr && r.ocr && r.ocr.ok);
+  // сумму отмечаем, только если картинка подтверждает ДРУГУЮ сумму (ту же, что назвал сайт), а суммы тикета на ней нет; если число просто не прочиталось — не отмечаем
+  const sumBad = (r) => !r.error && !!r.shot && r.shot.sumRes === 'bad' && ocrConfirmed(r) && !r.ocr.sumFound && !!(r.ocr.siteSeen || r.ocr.repeat);
+  const walletBad = () => false;
+  const isShot = (r) => sumBad(r) || walletBad(r);
+  const SHOT_TXT = { bad: 'не совпала', user: 'совпала с кошельком ПОЛЬЗОВАТЕЛЯ', ok: 'совпала', unknown: 'не определить', none: 'нет чека' };
+
+  // ---------- фоновый режим: запрос истории без открытия окна ----------
+  // ищет в ответе массив объектов (строки истории)
+  function findRows(node, keys, depth) {
+    if (!node || typeof node !== 'object' || depth > 6) return null;
+    if (Array.isArray(node)) {
+      if (node.length && node[0] && typeof node[0] === 'object' && keys.some((k) => k in node[0])) return node;
+      for (const x of node) { const r = findRows(x, keys, depth + 1); if (r) return r; }
+      return null;
+    }
+    for (const k of Object.keys(node)) { const r = findRows(node[k], keys, depth + 1); if (r) return r; }
+    return null;
+  }
+  // строки истории: нам нужны данные распознавания (socratResults), сумма и кошельки
+  function parseApiHistory(j) {
+    const arr = findRows(j, ['dateEdit', 'socratResults'], 0);
+    if (!arr) throw new Error('в ответе нет строк истории');
+    return arr.map((o) => ({ date: String(o.dateEdit == null ? '' : o.dateEdit), soc: parseSoc(o.socratResults), amount: o.amount, agentW: o.walletAccountNumber, userW: o.numberWallet, cur: o.currencyKode || o.currency_kode || o.currencyCode || o.currency || o.orderCurrency || '' }));
+  }
+  async function fetchHistoryRaw(id) {
+    if (!/^\d+$/.test(id)) throw new Error('Ticket ID не число');
+    const headers = Object.assign({ 'Content-Type': 'application/json;charset=UTF-8', Accept: 'application/json, text/plain, */*', 'X-Requested-With': 'XMLHttpRequest' }, learned);
+    let r;
+    for (let a = 0; ; a++) {
+      r = await fetch(location.origin + CFG.historyApi, { method: 'POST', credentials: 'include', headers, body: JSON.stringify({ ticketId: Number(id), is_iframe: 1 }) });
+      if (r.ok) break;
+      const retryable = r.status === 429 || r.status >= 500;
+      if (!retryable || a >= CFG.apiRetries) throw new Error('HTTP ' + r.status);
+      const ra = Number(r.headers.get('Retry-After'));
+      await sleep(ra > 0 ? Math.min(ra * 1000, 30000) : CFG.apiBackoffMs * Math.pow(2, a));
+    }
+    try { return await r.json(); } catch (e) { throw new Error('ответ не JSON'); }
+  }
+  const fetchHistoryApi = async (id) => parseApiHistory(await fetchHistoryRaw(id));
+
+  // ---------- меню ----------
+  const style = document.createElement('style');
+  style.textContent = `
+    #ts-panel, #ts-panel * { box-sizing: border-box; }
+    #ts-panel .ts-sec { font-weight: 700; margin: 8px 0 4px; color: #23909f; font-size: 11px; text-transform: uppercase; letter-spacing: .4px; }
+    #ts-panel label { display: block; margin-bottom: 4px; cursor: pointer; }
+    #ts-panel button { width: 100%; margin-bottom: 4px; }
+    #ts-panel .ts-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 4px; margin-bottom: 4px; }
+    #ts-panel .ts-grid button { margin: 0; padding: 3px 2px; font-size: 12px; }
+    #ts-panel pre { max-height: 160px; overflow: auto; font-size: 11px; white-space: pre-wrap; background: #f5f5f5; padding: 4px; margin: 4px 0 0; }
+    td[data-tsb]::after { content: attr(data-tsb); display: block; margin-top: 2px; font: 600 10px/1.2 Arial, sans-serif; color: inherit; white-space: normal; }
+  `;
+  document.head.appendChild(style);
+
+  const launcher = document.createElement('button');
+  launcher.type = 'button';
+  launcher.title = 'Сверка скриншота с тикетом';
+  launcher.style.cssText =
+    'position:fixed;right:188px;bottom:12px;z-index:999999;background:#c41d7f;color:#fff;border:none;border-radius:20px;' +
+    'box-sizing:border-box;width:80px;padding:8px 0;text-align:center;white-space:nowrap;font:700 13px Arial,sans-serif;cursor:pointer;box-shadow:0 2px 10px rgba(0,0,0,.35)';
+  launcher.textContent = 'Скрины';
+  document.body.appendChild(launcher);
+
+  const BUILD_DATE = '2026-11-07';                      // дата выхода этой версии — менять вместе с @version при каждом выпуске
+  const VER = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) || '1.47';
+  const fmtDate = (d) => { const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(d || ''); return m ? `${m[3]}.${m[2]}.${m[1]}` : ''; };
+  // когда эта версия впервые запустилась у вас (то есть когда обновление реально дошло до вашего браузера)
+  const installedOn = (() => {
+    try {
+      const k = 'ts_ver_seen_v1', cur = JSON.parse(localStorage.getItem(k) || '{}');
+      if (cur.v !== VER) { const n = { v: VER, d: new Date().toISOString().slice(0, 10) }; localStorage.setItem(k, JSON.stringify(n)); return n.d; }
+      return cur.d || '';
+    } catch (e) { return ''; }
+  })();
+  const panel = document.createElement('div');
+  panel.id = 'ts-panel';
+  panel.style.cssText =
+    'position:fixed;right:188px;bottom:56px;z-index:999999;background:#fff;border:2px solid #c41d7f;border-radius:8px;' +
+    'padding:10px;font:13px/1.4 Arial,sans-serif;width:300px;max-height:calc(100vh - 80px);overflow:auto;' +
+    'box-shadow:0 4px 16px rgba(0,0,0,.3);color:#222;display:none';
+  panel.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center"><b>Сверка скриншота с тикетом</b> <span style="font-weight:400;color:#888;font-size:11px" title="Версия плагина и дата выхода; ниже — когда она стала у вас">v${VER} · ${fmtDate(BUILD_DATE)}</span><span id="ts-x" style="cursor:pointer;font-size:16px;padding:0 4px" title="Закрыть меню">✕</span></div>
+    <div id="ts-sets">
+      <div class="ts-sec">Проверка</div>
+      <div style="font-size:11px;color:#666;margin-bottom:4px">Сумма тикета сверяется со скриншотом чека. Сначала данные распознавания сайта; если они не сошлись — распознаётся сама картинка. Отмечается, только если расхождение подтверждено; всё сомнительное идёт в «проверить вручную».</div>
+      <div id="ts-verline" style="font-size:11px;color:#888;margin-bottom:4px">Версия ${VER}, вышла ${fmtDate(BUILD_DATE)}${installedOn ? ', у вас с ' + fmtDate(installedOn) : ''}.</div>
+      <div id="ts-lockednote" style="display:none;font-size:11px;color:#389e0d;margin-bottom:4px">✓ Распознавание картинок подключено администратором (настройки скрыты).</div>
+      <div id="ts-ocrbox">
+      <label><input type="checkbox" id="ts-ocr"> Распознавать картинки для спорных тикетов (рекомендуется)</label>
+      <div style="font-size:11px;color:#666;margin:4px 0 2px">Распознавание через Google Apps Script (читает арабские и персидские цифры). Адрес приложения (оканчивается на /exec):</div>
+      <input type="text" id="ts-gurl" placeholder="https://script.google.com/macros/s/…/exec" style="width:100%;margin-bottom:4px" autocomplete="off">
+      <input type="password" id="ts-gsecret" placeholder="секретное слово из скрипта" style="width:100%;margin-bottom:4px" autocomplete="off">
+      <div style="font-size:11px;color:#666;margin-bottom:4px">Пока адрес не задан — слабое распознавание в браузере (арабские цифры не читает).</div>
+      </div>
+      <div class="ts-sec">Отображение</div>
+      <label title="Все скриншоты тикетов читаются через Google, а не только спорные. Медленнее и расходует больше запросов. Отмечается только если Google ясно видит другую сумму."><input type="checkbox" id="ts-all"> Читать через Google все скриншоты (медленнее)</label>
+      <label><input type="checkbox" id="ts-hide"> Скрыть тикеты без проблем</label>
+      <label><input type="checkbox" id="ts-badges"> Подписи в ячейке</label>
+      <div style="font-size:11px;color:#666;margin-bottom:4px">Красный — не сошлось (подтверждено), оранжевый — на скриншоте нет суммы, жёлтый — проверить вручную, зелёный — сошлось.</div>
+    </div>
+    <div class="ts-sec">Результат</div>
+    <div id="ts-stat" style="margin-bottom:2px">—</div>
+    <div id="ts-gs" style="font-size:11px;margin-bottom:6px;color:#555"></div>
+    <button id="ts-run">Проверить страницу</button>
+    <button id="ts-retry">Повторить ошибки</button>
+    <button id="ts-redo">Перепроверить «вручную»</button>
+    <div class="ts-sec">Копировать ID</div>
+    <div class="ts-grid"><button id="ts-c-bad">Не сошлось</button><button id="ts-c-nosum">Нет суммы</button><button id="ts-c-review">Вручную</button><button id="ts-c-error">Ошибки</button></div>
+    <div class="ts-sec">Все страницы</div>
+    <label><input type="checkbox" id="ts-first"> Начать с 1-й страницы</label>
+    <button id="ts-crawl">Все страницы → проверить</button>
+    <button id="ts-resume" disabled>Продолжить с текущей</button>
+    <button id="ts-stop" disabled>Стоп</button>
+    <button id="ts-xlsx" disabled>Скачать Excel</button>
+    <button id="ts-diag">Диагностика</button>
+    <button id="ts-ocrtest">Тест распознавания скрина (1 тикет)</button>
+    <button id="ts-cacheclr">Очистить кэш распознавания</button>
+    <div id="ts-msg" style="font-size:12px;color:#555"></div>
+    <pre id="ts-pre" style="display:none"></pre>`;
+  document.body.appendChild(panel);
+  const $ = (q) => panel.querySelector(q);
+  const msg = (t) => ($('#ts-msg').textContent = t);
+  const setStat = (t) => ($('#ts-stat').textContent = t);
+
+  const showPanel = (v) => { S.open = v; panel.style.display = v ? 'block' : 'none'; saveSettings(); };
+  launcher.onclick = () => showPanel(panel.style.display === 'none');
+  $('#ts-x').onclick = () => showPanel(false);
+  showPanel(!!S.open);
+
+  function syncUI() {
+    $('#ts-gurl').value = S.gurl || ''; $('#ts-gsecret').value = S.gsecret || ''; $('#ts-ocr').checked = !!S.ocr; $('#ts-hide').checked = !!S.hide; $('#ts-all').checked = !!S.all; $('#ts-badges').checked = !!S.badges; $('#ts-first').checked = !!S.first;
+  }
+  const changed = () => { saveSettings(); run(); };
+  $('#ts-gurl').onchange = (e) => {
+    const u = e.target.value.replace(/^[\s"'`]+|[\s"'`]+$/g, '');
+    e.target.value = u; S.gurl = u; saveSettings();
+    if (!u) msg('Адрес удалён. Распознавание — в браузере.');
+    else if (u.split(/[\s,;]+/).filter(Boolean).some((x) => !/^https:\/\/script\.google\.com\/.+\/exec$/.test(x))) msg('⚠ Адрес выглядит неверно: должен начинаться с https://script.google.com/ и заканчиваться на /exec (это адрес «Веб-приложения», а не редактора).');
+    else msg('Адрес сохранён (можно указать несколько адресов через пробел — нагрузка поделится между ними). Введите секретное слово и нажмите «Тест распознавания скрина».');
+  };
+  $('#ts-gsecret').onchange = (e) => { S.gsecret = e.target.value.trim(); saveSettings(); msg('Секретное слово сохранено.'); refreshG(); };
+  // сохранение сразу при вводе/вставке (не ждём ухода из поля) + видимый статус под полями
+  $('#ts-gsecret').insertAdjacentHTML('afterend', '<div id="ts-gstat" style="font-size:11px;margin-bottom:4px"></div>');
+  function refreshG() {
+    const ok = !!S.gurl && !!S.gsecret;
+    const el = $('#ts-gstat');
+    el.style.color = ok ? '#389e0d' : '#cf1322';
+    el.textContent = ok ? '✓ адрес и секретное слово сохранены' : (S.gurl ? '⚠ секретное слово не задано' : '⚠ адрес Apps Script не задан — картинки читает слабый движок');
+  }
+  const cleanU = (v) => String(v || '').replace(/^[\s"'`]+|[\s"'`]+$/g, '');
+  if (!IS_LOCKED) $('#ts-gurl').addEventListener('input', (e) => { S.gurl = cleanU(e.target.value); saveSettings(); refreshG(); });
+  if (!IS_LOCKED) $('#ts-gsecret').addEventListener('input', (e) => { S.gsecret = String(e.target.value || '').trim(); saveSettings(); refreshG(); });
+  refreshG();
+  if (IS_LOCKED) { $('#ts-ocrbox').style.display = 'none'; $('#ts-lockednote').style.display = 'block'; }
+  $('#ts-ocr').onchange = (e) => { S.ocr = e.target.checked; changed(); };
+  $('#ts-hide').onchange = (e) => { S.hide = e.target.checked; changed(); };
+  $('#ts-all').onchange = (e) => { S.all = e.target.checked; changed(); msg(S.all ? 'Режим «читать все скриншоты» включён: нажмите «Перепроверить «вручную»» или запустите проверку заново — тикеты без чека на сайте и «сошедшиеся» тоже будут прочитаны Google.' : 'Режим «читать все скриншоты» выключен.'); };
+  $('#ts-badges').onchange = (e) => { S.badges = e.target.checked; changed(); };
+  $('#ts-first').onchange = (e) => { S.first = e.target.checked; saveSettings(); };
+
+  const results = new Map();   // id -> результат проверки
+  let gErr = 0;                // сбои Google (для автоматического снижения параллельности распознавания)
+  let apiActive = 0, crawlOn = false;
+  let busy = false;            // идёт проверка (не перерисовываем список в это время)
+  let running = false;
+  let aborted = false;
+  let curPageNo = 0;
+
+  const newRes = (row) => ({ id: row.id, error: true, shot: null, ocr: null, n: 0, note: '', page: '', via: '' });
+
+  // итог по тикету: error / none (чеков нет) / ok / review (проверить вручную) / bad (не сошлось, подтверждено)
+  const st = (r) => {
+    if (r.error) return 'error';
+    if (!r.shot || (!r.shot.m && !allMode(r))) return 'none';
+    if (!siteSuspect(r)) return 'ok';
+    if (allMode(r) && r.shot.sumRes !== 'bad') {                       // режим «все скриншоты»: сайт сумму принял — отмечаем, только если Google ясно видит ДРУГУЮ сумму
+      if (!r.ocr || !r.ocr.ok) return r.shot.m ? 'ok' : 'none';
+      if (r.ocr.onlyForms || r.ocr.sumFound) return curConflict(r) ? 'review' : 'ok';
+      return r.ocr.repeat ? 'bad' : (r.shot.m ? 'ok' : 'none');
+    }
+    if (S.ocr && r.ocr && r.ocr.onlyForms) return 'ok';
+    if (S.ocr && r.ocr && r.ocr.sumFound) return curConflict(r) ? 'review' : 'ok';              // сумма тикета найдена на картинке — расхождение сайта опровергнуто (если не расходится валюта)
+    if (!S.ocr || !r.ocr || !r.ocr.ok) return 'review';
+    if (isShot(r)) return 'bad';
+    if (r.ocr.noAmount && r.shot.sumRes === 'bad') return 'nosum';        // сумма на скриншоте отсутствует — отдельная таблица
+    const sumOK = r.shot.sumRes !== 'bad' || r.ocr.sumFound;
+    return sumOK ? 'ok' : 'review';
+  };
+  function reviewReason(r) {
+    if (!S.ocr) return 'распознавание картинок выключено';
+    if (!r.ocr) return 'ждёт распознавания картинки';
+    if (curConflict(r)) return `валюта на чеке (${curSeenText(r)}) не совпадает с валютой тикета (${curCode(r.cur)}) — проверьте вручную`;
+    if (!r.ocr.ok) {
+      const e = r.ocr.err || 'картинку не удалось прочитать';
+      if (/не JSON|HTTP [45]\d\d|too many|rate limit|quota|unavailable|overload|timed? ?out|Timeout|сеть|network|Failed to fetch/i.test(e)) return 'Google не ответил (перегрузка, лимит или неверный адрес скрипта): ' + e;
+      if (/не картинка/.test(e)) return 'по ссылке не картинка и не PDF: ' + e;
+      if (/слишком больш/.test(e)) return 'файл слишком большой для распознавания: ' + e;
+      if (/не распознан/.test(e)) return 'текст на картинке не распознан даже после усиления (размытое, тёмное или обрезанное фото)';
+      if (/нет ссылок/.test(e)) return 'в списке нет файлов пользователя';
+      return 'не удалось прочитать картинку: ' + e;
+    }
+    const p = [];
+    if (r.shot && r.shot.sumRes === 'bad' && !r.ocr.sumFound) p.push('суммы тикета нет среди прочитанных чисел' + (r.ocr.siteSeen ? '' : ', сумма сайта на картинке тоже не найдена'));
+    return 'расхождение не подтверждено картинкой: ' + (p.join('; ') || 'числа не прочитаны уверенно');
+  }
+
+  function paint(rows) {
+    rows.forEach((r) => {
+      const res = results.get(r.id);
+      let color = '', badge = '', title = '';
+      if (res) {
+        const s = st(res);
+        color = COLORS[s] || '';
+        if (s === 'none' && res.links && !res.links.length) { color = COLORS.nofile; badge = 'нет скриншота'; title = "В User files и Support team's files нет ссылок"; }
+        if (s === 'error') { badge = 'ошибка'; title = res.note; }
+        else if (s !== 'none') {
+          if (res.shot) title = `Чеков распознано сайтом: ${res.shot.m} из ${res.shot.n}; сумма тикета ${res.shot.amount}, по данным сайта на чеке ${res.shot.sums.join(' / ') || '—'} (${SHOT_TXT[res.shot.sumRes]})`;
+          if (res.ocr) title += '\nРаспознавание картинки: ' + (res.ocr.ok ? `на чеке (Google): ${(res.ocr.sums || []).join(' / ') || '—'}; сумма тикета ${res.ocr.sumFound ? 'найдена' : 'не найдена'}${res.ocr.siteSeen ? ' (на картинке видна сумма сайта)' : ''}` : 'не удалось (' + res.ocr.err + ')');
+          if (s === 'bad') badge = 'суммы тикета нет на скрине';
+          else if (s === 'nosum') { badge = 'нет суммы на скрине'; title += '\nНа скриншоте нет суммы (обрезан скрин или показан не тот экран).'; }
+          else if (s === 'review') { badge = 'проверить вручную'; title += '\n' + reviewReason(res); }
+        }
+      }
+      r.tCell.style.background = color;
+      r.tCell.style.fontWeight = color && res && ['bad', 'review', 'nosum'].includes(st(res)) ? '700' : '';
+      r.tCell.title = title;
+      if (S.badges && badge) r.tCell.setAttribute('data-tsb', badge); else r.tCell.removeAttribute('data-tsb');
+      r.tr.style.display = S.hide && res && ['ok', 'none'].includes(st(res)) ? 'none' : '';
+    });
+  }
+  function counts() {
+    const v = [...results.values()].map(st);
+    const c = (k) => v.filter((x) => x === k).length;
+    return { bad: c('bad'), nosum: c('nosum'), review: c('review'), ok: c('ok'), none: c('none'), error: c('error') };
+  }
+  function run() {
+    const rows = analyze();
+    if (!rows) { setStat('Таблица не найдена'); return; }
+    paint(rows);
+    const c = counts();
+    const w = (rows.idx.user < 0 && rows.idx.sup < 0) ? '<div style="color:#d4380d;font-size:12px">⚠ Нет колонки User files (включите её в Column settings) — без неё картинки не распознать</div>' : '';
+    $('#ts-stat').innerHTML = `Строк: <b>${rows.length}</b> · к проверке: <b>${rows.filter((r) => !results.has(r.id)).length}</b><br>` +
+      `всего проверено: сошлось <b style="color:#389e0d">${c.ok}</b> · не сошлось <b style="color:#cf1322">${c.bad}</b> · нет суммы <b style="color:#d4380d">${c.nosum}</b> · вручную <b style="color:#ad8b00">${c.review}</b> · без чека ${c.none} · ошибок <b>${c.error}</b>${w}`;
+  }
+
+  let apiAllFailed = false;
+  async function apiPass() {
+    const L = analyze();
+    if (!L) return;
+    const rows = L.filter((r) => !results.has(r.id));
+    if (!rows.length) return;
+    busy = true; apiActive++;
+    let ok = 0, fail = 0, firstErr = '', next = 0;
+    const worker = async () => {
+      while (!aborted) {
+        const row = rows[next++];
+        if (!row) return;
+        const res = newRes(row);
+        res.page = curPageNo || ''; res.via = 'фон'; res.links = row.userLinks || []; res.cur = row.cur || '';
+        if (!res.links.length) { res.shot = null; res.n = 0; res.error = false; results.set(row.id, res); ok++; continue; }   // нет файлов — проверять нечего, историю не запрашиваем
+        try {
+          const entries = await fetchHistoryApi(row.id);
+          res.shot = analyzeShots(entries); res.n = entries.length; res.error = false;
+          if (!res.cur) res.cur = (entries.find((e) => e.cur) || {}).cur || '';
+          ok++;
+        } catch (e) { fail++; res.note = e.message; if (!firstErr) firstErr = e.message; }
+        results.set(row.id, res);
+        setStat(`Запрашиваю историю: ${ok + fail} из ${rows.length}…`);
+        await sleep(CFG.apiGapMs);
+      }
+    };
+    await Promise.all(Array.from({ length: CFG.concurrency }, worker));
+    apiActive--; busy = false;
+    apiAllFailed = ok === 0 && fail > 0;
+    run();
+    if (apiAllFailed) msg(`История не читается (${firstErr}). Нажмите «Диагностика».`);
+    else if (fail > 0) msg(`История получена для ${ok}, не удалось ${fail} (${firstErr}) — см. «Повторить ошибки».`);
+  }
+
+  // ---------- фоновая очередь распознавания: идёт параллельно с загрузкой истории и переходом по страницам ----------
+  const ocrQ = { workers: 0, active: 0, max: 1, done: 0, okc: 0, errMsg: '', fatal: false, fatalN: 0, okTotal: 0, okRun: 0, lastPaint: 0 };
+  const ocrNeeds = (x) => x && !x.error && siteSuspect(x) && (!x.ocr || (x.ocr.retriable && (x.ocrTries || 0) < 3));
+  const ocrLeft = () => { let n = 0; for (const x of results.values()) if (ocrNeeds(x) && !x.ocrBusy) n++; return n; };
+  const ocrNext = () => { const now = Date.now(); for (const x of results.values()) if (ocrNeeds(x) && !x.ocrBusy && now >= (x.ocrAfter || 0)) return x; return null; };
+  async function ocrWorker() {
+    while (!aborted && !ocrQ.fatal) {
+      if (ocrQ.active >= ocrQ.max) { await sleep(300); continue; }
+      const x = ocrNext();
+      if (!x) { if (apiActive > 0 || crawlOn || ocrLeft() > 0) { await sleep(400); continue; } return; }
+      ocrQ.active++; x.ocrBusy = true;
+      const e0 = gErr;
+      try {
+        x.ocr = (x.links && x.links.length) ? await ocrCheckRow(x, x.links) : { ok: false, err: 'в списке нет ссылок на файлы пользователя' };
+      } catch (e) { x.ocr = { ok: false, err: e.message, retriable: true }; }
+      x.ocrTries = (x.ocrTries || 0) + 1; x.ocrBusy = false; ocrQ.active--;
+      if (x.ocr.retriable) x.ocrAfter = Date.now() + 6000 * x.ocrTries;
+      if (x.ocr.fatal) {
+        if (ocrQ.fatalN < 6) {                            // раньше Google отвечал нормально → это сбой/перегрузка, а не неверная настройка: ждём и продолжаем
+          ocrQ.fatalN++; x.ocr.fatal = false; x.ocr.retriable = true; x.ocrAfter = Date.now() + 15000;
+          ocrQ.errMsg = x.ocr.err; ocrQ.max = 1; ocrQ.okRun = 0;
+          await sleep(10000);
+        } else { ocrQ.fatal = true; ocrQ.errMsg = x.ocr.err; }
+      }
+      ocrQ.done++;
+      if (x.ocr.ok || x.ocr.onlyForms) { ocrQ.okc++; ocrQ.okTotal++; ocrQ.fatalN = 0; } else ocrQ.errMsg = x.ocr.err;
+      // адаптивная параллельность: при сбоях Google снижаем, при ровной работе повышаем (до 5)
+      if (gErr > e0) { ocrQ.max = Math.max(1, ocrQ.max - 1); ocrQ.okRun = 0; await sleep(3000); }
+      else if (++ocrQ.okRun >= 10 && ocrQ.max < 4 * Math.min(4, gUrls().length || 1)) { ocrQ.max++; ocrQ.okRun = 0; }
+      if (Date.now() - ocrQ.lastPaint > 1500) { ocrQ.lastPaint = Date.now(); run(); }
+      setStat(`Распознаю скриншоты: готово ${ocrQ.done}, в очереди ${ocrLeft()}…`); paintG();
+    }
+  }
+  function kickOcr() {
+    if (!S.ocr) return;
+    if (ocrQ.fatal && crawlOn) return;                              // фатальная ошибка Google — до конца обхода не повторяем
+    if (ocrQ.workers === 0) { ocrQ.fatal = false; ocrQ.done = 0; ocrQ.okc = 0; ocrQ.errMsg = ''; ocrQ.active = 0; ocrQ.max = S.gurl ? 2 * Math.min(4, gUrls().length || 1) : 1; ocrQ.okRun = 0; }
+    const need = S.gurl ? 4 * Math.min(4, gUrls().length || 1) : 1;
+    while (ocrQ.workers < need) { ocrQ.workers++; ocrWorker().finally(() => { ocrQ.workers--; }); }
+  }
+  // «добивка»: тикеты, у которых картинку не удалось прочитать из-за сбоев (нагрузка, лимиты), перечитываем ещё раз — медленно, в один поток
+  async function ocrSweep() {
+    if (aborted || !S.ocr) return;
+    for (let round = 0; round < 3 && !aborted && ocrQ.workers === 0 && ocrLeft() > 0; round++) {   // очередь остановилась — до трёх попыток, один поток
+      ocrQ.fatal = false; ocrQ.fatalN = 0;
+      for (const x of results.values()) if (ocrNeeds(x) && x.ocr) x.ocrTries = 0;
+      msg(`Распознавание не дошло до ${ocrLeft()} тикетов — повторяю через несколько секунд (попытка ${round + 1} из 3)…`);
+      await sleep(8000 * (round + 1));
+      kickOcr(); ocrQ.max = 1; ocrQ.okRun = -1000;
+      while (!aborted && ocrQ.workers > 0) await sleep(400);
+      run();
+    }
+    if (!aborted) for (const x of results.values()) if (!x.error && siteSuspect(x) && !x.ocr) x.ocr = { ok: false, err: 'Google не ответил на запросы распознавания (' + String(ocrQ.errMsg || 'нет ответа').slice(0, 100) + ') — нажмите «Перепроверить «вручную»»', retriable: true };
+    const redo = [...results.values()].filter((x) => !x.error && ocrQ.workers === 0 && st(x) === 'review' && x.ocr && !x.ocr.ok && x.ocr.err && !x.ocr.onlyForms && !x.ocr.fatal && !/не распознан|нет ссылок|слишком больш/i.test(x.ocr.err));
+    if (!redo.length) return;
+    msg(`Добиваю тикеты, на которых были сбои чтения: ${redo.length}…`);
+    await sleep(8000);
+    redo.forEach((x) => { x.ocr = null; x.ocrTries = 0; x.ocrAfter = 0; });
+    kickOcr(); ocrQ.max = 1; ocrQ.okRun = -1000;                      // один поток, без повышения
+    while (!aborted && ocrQ.workers > 0) await sleep(400);
+    run();
+  }
+  async function ocrDrain() {
+    kickOcr();
+    while (!aborted && ocrQ.workers > 0) await sleep(400);
+    run();
+    if (!ocrQ.okc && ocrQ.done) msg(`Распознавание картинок не сработало: ${ocrQ.errMsg}. Скрины не отмечены.`);
+  }
+
+  // проверка всех непроверенных тикетов текущей страницы; 'ok' | 'errors' | 'aborted'
+  async function checkPage() {
+    const L = analyze();
+    if (!L) return 'ok';
+    await apiPass();
+    if (aborted) return 'aborted';
+    if (apiAllFailed) return 'errors';
+    if (S.ocr) {
+      kickOcr();
+      if (!crawlOn) { await ocrDrain(); await ocrSweep(); if (aborted) return 'aborted'; }
+      else {                                                           // обход: перед переходом на следующую страницу дочитываем спорные тикеты этой (как при проверке одной страницы)
+        const t0 = Date.now();
+        while (!aborted && ocrQ.workers > 0 && (ocrLeft() > 0 || ocrQ.active > 0) && Date.now() - t0 < 600000) {
+          setStat(`Распознаю скриншоты страницы: осталось ${ocrLeft() + ocrQ.active}…`);
+          await sleep(400);
+        }
+        run();
+        if (aborted) return 'aborted';
+      }
+    }
+    return 'ok';
+  }
+
+  function setRunning(v) {
+    running = v;
+    ['#ts-run', '#ts-retry', '#ts-redo', '#ts-diag', '#ts-ocrtest', '#ts-crawl'].forEach((q) => { $(q).disabled = v; });
+    $('#ts-resume').disabled = v || pagesDone === 0;
+    $('#ts-stop').disabled = !v;
+    $('#ts-xlsx').disabled = v || results.size === 0;
+    panel.querySelectorAll('#ts-sets input').forEach((el) => { el.disabled = v; });
+  }
+
+  $('#ts-run').onclick = async () => {
+    if (running) return;
+    aborted = false; curPageNo = 0; setRunning(true);
+    const r = await checkPage();
+    run(); setRunning(false);
+    if (r === 'errors') return;   // сообщение об ошибке уже в строке статуса
+    msg(r === 'aborted' ? 'Остановлено.' : 'Страница проверена.');
+  };
+  $('#ts-redo').onclick = () => {
+    if (running) return;
+    let n = 0;
+    results.forEach((x) => { if (!x.error && st(x) === 'review') { x.ocr = null; x.ocrTries = 0; x.ocrAfter = 0; n++; } });
+    msg(`Перепроверяю «вручную»: ${n}…`);
+    run(); $('#ts-run').onclick();
+  };
+  $('#ts-retry').onclick = () => {
+    [...results.entries()].forEach(([id, r]) => { if (r.error) results.delete(id); });
+    run(); $('#ts-run').onclick();
+  };
+
+  function copy(text) {
+    if (typeof GM_setClipboard === 'function') GM_setClipboard(text);
+    else navigator.clipboard.writeText(text);
+  }
+  const LBL = { bad: 'не сошлось', nosum: 'нет суммы', review: 'проверить вручную', error: 'ошибки' };
+  ['bad', 'nosum', 'review', 'error'].forEach((k) => {
+    $('#ts-c-' + k).onclick = () => {
+      const ids = [...results.values()].filter((r) => st(r) === k).map((r) => r.id);
+      copy(ids.join('\n'));
+      msg(`Скопировано (${LBL[k]}): ${ids.length}`);
+    };
+  });
+
+  // ---------- обход всех страниц ----------
+  const getTotals = () => {
+    const m = document.body.innerText.match(/from\s+(\d+)\s+to\s+(\d+)\s+of\s+(\d+)/i);
+    return m ? { from: +m[1], to: +m[2], total: +m[3] } : null;
+  };
+  const signature = () => {
+    const t = getTotals();
+    const a = analyze();
+    return (t ? t.from + '-' + t.to : '') + '|' + (a && a[0] ? a[0].id : '');
+  };
+
+  // пагинация ищется по содержимому: ряд элементов вида «‹ 1 … 4 5 6 … 39 ›»
+  const PAGER_TEXT = /^(\d+|…|\.{2,3}|[‹›«»<>])?$/;
+  const isNum = (el) => /^\d+$/.test((el.innerText || '').trim());
+  let pageSize = 0;
+
+  function findPagerBox() {
+    if (CFG.pagerSelector) return document.querySelector(CFG.pagerSelector);
+    const cands = [...document.querySelectorAll('ul,ol,nav,div')].filter((el) => {
+      if (panel.contains(el) || el.closest('#ts-panel,#tn-panel,#th-panel') || el.closest('table')) return false;
+      const kids = [...el.children];
+      if (kids.length < 4 || kids.length > 25) return false;
+      if (!kids.every((k) => PAGER_TEXT.test((k.innerText || '').trim()))) return false;
+      return kids.filter(isNum).length >= 3;
+    });
+    cands.sort((a, b) => a.querySelectorAll('*').length - b.querySelectorAll('*').length);
+    return cands[0] || null;
+  }
+
+  function getPager() {
+    const box = findPagerBox();
+    if (!box) return null;
+    const items = [...box.children];
+    let active = items.find(
+      (k) => /active|current|selected/i.test(k.className || '') ||
+        k.getAttribute('aria-current') ||
+        k.querySelector('.active,.current,.selected,[aria-current]')
+    );
+    const t = getTotals();
+    if (t) pageSize = Math.max(pageSize, t.to - t.from + 1);
+    if (!active && t && pageSize) {
+      const cur = Math.floor((t.from - 1) / pageSize) + 1;
+      active = items.find((k) => (k.innerText || '').trim() === String(cur));
+    }
+    return { box, items, active };
+  }
+
+  // запасной поиск кнопки «далее» по тексту / aria-label / title / rel / классу
+  function findNextFallback() {
+    const re = /^(›|»|>|next|вперед|вперёд|далее|следующая)$/i;
+    const cands = [...document.querySelectorAll('a,button,li,span,[role=button]')].filter((el) => {
+      if (panel.contains(el) || el.closest('#ts-panel,#tn-panel,#th-panel') || el.closest('table') || !visible(el)) return false;
+      const attrs = [el.getAttribute('aria-label'), el.getAttribute('title'), el.getAttribute('rel')].filter(Boolean).join(' ');
+      return re.test((el.innerText || '').trim()) || /(^|\s)next(\s|$)/i.test(attrs) || /(^|[\s_-])next([\s_-]|$)/i.test(el.getAttribute('class') || '');
+    });
+    return cands.find((el) => !isDisabled(el)) || cands[0] || null;
+  }
+  function findNext() {
+    if (CFG.nextSelector) return document.querySelector(CFG.nextSelector);
+    const p = getPager();
+    if (!p) return findNextFallback();
+    const lastItem = p.items[p.items.length - 1];
+    if (!isNum(lastItem)) return lastItem;            // стрелка «›»
+    const i = p.items.indexOf(p.active);
+    return (i >= 0 && i < p.items.length - 1 ? p.items[i + 1] : null) || findNextFallback();
+  }
+  function findFirst() {
+    const p = getPager();
+    if (!p) return null;
+    return p.items.find((el) => (el.innerText || '').trim() === '1') || null;
+  }
+  const isDisabled = (el) =>
+    !el || [el, el.querySelector('a,button')].some(
+      (n) => n && (n.classList.contains('disabled') || n.getAttribute('aria-disabled') === 'true' || n.hasAttribute('disabled'))
+    );
+  const clickItem = (el) => (el.querySelector('a,button') || el).click();
+
+  // ждём смены страницы и пока таблица "устаканится"
+  async function settle(t0, limit) {
+    let prev = signature(), same = 0;
+    while (same < 2 && Date.now() - t0 < limit) {
+      await sleep(300);
+      const cur = signature();
+      const n = (analyze() || []).length;
+      if (cur === prev && n > 0) same++; else { same = 0; prev = cur; }
+    }
+    return same >= 2;
+  }
+  async function waitChange(before, limit) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < limit) {
+      await sleep(300);
+      if (signature() !== before) return settle(t0, limit);
+    }
+    return false;
+  }
+
+  // клик с повторами; если страница сменилась с опозданием — повторно не кликаем (чтобы не перескочить страницу)
+  async function clickAndWait(getEl) {
+    const before = signature();
+    for (let attempt = 1; attempt <= CFG.retries; attempt++) {
+      if (signature() !== before) { if (await settle(Date.now(), CFG.pageWaitMs)) return 'ok'; }
+      const el = getEl();
+      if (!el) return 'missing';
+      if (isDisabled(el)) return 'disabled';
+      clickItem(el);
+      if (await waitChange(before, CFG.pageWaitMs * attempt)) return 'ok';
+      if (aborted) return 'aborted';
+      msg(`Страница долго грузится, повтор ${attempt}/${CFG.retries}…`);
+      await sleep(1500);
+    }
+    return signature() !== before ? 'ok' : 'timeout';
+  }
+
+
+  let visited = new Set();     // «from» каждой пройденной страницы
+  let pagesDone = 0;
+
+  function reviewStats() {
+    const warn = (S.ocr && !S.gurl && !S.gkey) ? ' ⚠ АДРЕС APPS SCRIPT НЕ ЗАДАН В НАСТРОЙКАХ — картинки читал слабый движок в браузере, поэтому так много «вручную». Впишите адрес и секретное слово в меню «Скрины».' : '';
+    const m = {};
+    for (const r of results.values()) if (st(r) === 'review') { const k = reviewReason(r).replace(/\d+/g, 'N').slice(0, 70); m[k] = (m[k] || 0) + 1; }
+    const top = Object.entries(m).sort((a, b) => b[1] - a[1]).slice(0, 4).map(([k, n]) => `${n}× ${k}`);
+    const last = ocrQ.errMsg ? ` Последняя ошибка Google: ${String(ocrQ.errMsg).slice(0, 120)}.` : '';
+    return warn + last + (top.length ? ` Причины ручной проверки: ${top.join('; ')}.` : '');
+  }
+  function coverage() {
+    const t = getTotals();
+    if (!t || !pageSize) return '';
+    const expected = Math.ceil(t.total / pageSize);
+    const missing = [];
+    for (let i = 1; i <= expected; i++) if (!visited.has((i - 1) * pageSize + 1)) missing.push(i);
+    return missing.length
+      ? ` ⚠ Пройдено ${expected - missing.length} из ${expected} страниц. Не проверены: ${missing.slice(0, 15).join(', ')}${missing.length > 15 ? '…' : ''}.`
+      : ` ✔ Пройдены все ${expected} страниц.`;
+  }
+
+  const WHY = {
+    missing: 'не найдена кнопка «далее» / блок пагинации (нажмите «Диагностика» и пришлите результат)',
+    disabled: 'кнопка «далее» неактивна',
+    timeout: `страница не загрузилась после ${CFG.retries} попыток`,
+    aborted: 'остановлено кнопкой',
+  };
+
+
+  async function allPages(resume) {
+    if (running) return;
+    aborted = false;
+    if (!resume) { visited = new Set(); pagesDone = 0; }
+    setRunning(true);
+    let reason = '';
+    let note = '';
+    try {
+      // 1) перейти на первую страницу (не при продолжении)
+      if (!resume && S.first) {
+        const t = getTotals();
+        if (t && t.from > 1) {
+          const first = findFirst();
+          if (!first) note = 'кнопка «1» не найдена, старт с текущей. ';
+          else if (!isDisabled(first)) {
+            const r = await clickAndWait(findFirst);
+            if (r !== 'ok') note = 'не удалось перейти на 1-ю страницу, старт с текущей. ';
+          }
+        }
+      }
+
+      // 2) обход: на каждой странице проверяем историю всех тикетов нужных статусов; распознавание картинок идёт в фоне параллельно
+      crawlOn = true;
+      while (!aborted && pagesDone < 1000) {
+        run();
+        const t = getTotals();
+        if (t) { pageSize = Math.max(pageSize, t.to - t.from + 1); visited.add(t.from); }
+        pagesDone++;
+        curPageNo = pagesDone;
+        msg(`Страница ${pagesDone}${t ? ` (${t.to} из ${t.total})` : ''}…`);
+        const r = await checkPage();
+        if (r === 'errors') { reason = 'история не читается (3 ошибки подряд) — нажмите «Диагностика (1 тикет)»'; break; }
+        if (r === 'aborted') break;
+        msg(`Страница ${pagesDone} готова · проблемных: ${counts().bad}, ошибок: ${counts().error}`);
+        if (t && t.to >= t.total) { reason = 'последняя страница'; break; }
+        const nr = await clickAndWait(findNext);
+        if (nr !== 'ok') { reason = WHY[nr] || nr; break; }
+      }
+      crawlOn = false;
+      if (S.ocr && !aborted) { msg('Страницы пройдены, дожидаюсь распознавания картинок…'); await ocrDrain(); await ocrSweep(); }
+      if (aborted) reason = WHY.aborted;
+    } catch (e) {
+      crawlOn = false;
+      reason = 'ошибка: ' + e.message;
+      console.error('[ts]', e);
+    }
+    busy = false;
+    run();
+    const c = counts();
+    msg(`${note}Конец: ${reason || '—'}. Страниц: ${pagesDone}. Не сошлось: ${c.bad}, нет суммы на скрине: ${c.nosum}, проверить вручную: ${c.review}, ошибок: ${c.error}.${coverage()}${reviewStats()}`);
+    setRunning(false);
+  }
+
+  $('#ts-resume').onclick = () => allPages(true);
+  $('#ts-crawl').onclick = () => allPages(false);
+  $('#ts-stop').onclick = () => { aborted = true; };
+  $('#ts-cacheclr').onclick = () => { ocrCache.clear(); msg('Кэш распознавания очищен.'); paintG(); };
+
+  // Excel: «Не сошлось» / «Проверить вручную» / «Ошибки»
+  $('#ts-xlsx').onclick = () => {
+    if (typeof XLSX === 'undefined') { msg('Библиотека XLSX не загрузилась.'); return; }
+    const numId = (id) => (/^\d{1,15}$/.test(id) ? Number(id) : id);
+    const yn = (b) => (b ? 'да' : 'нет');
+    const all = [...results.values()];
+    const wb = XLSX.utils.book_new();
+    const add = (name, aoa, wch) => {
+      const sh = XLSX.utils.aoa_to_sheet(aoa);
+      sh['!cols'] = wch.map((w) => ({ wch: w }));
+      XLSX.utils.book_append_sheet(wb, sh, name);
+    };
+    const head = ['ticket_id', 'сумма тикета', 'сумма на чеке (Google)', 'сумма на чеке (по сайту, может быть неверно)', 'сумма', 'чеков распознано', 'скринов всего', 'картинка: сумма найдена', 'текст с картинки (фрагмент)', 'причина', 'page'];
+    const line = (r) => [numId(r.id), r.shot.amount, (r.ocr && r.ocr.sums && r.ocr.sums.length ? r.ocr.sums.join(' / ') : '—'), r.shot.sums.join(' / '), SHOT_TXT[r.shot.sumRes], r.shot.m, r.shot.n,
+      r.ocr && r.ocr.ok ? yn(r.ocr.sumFound) : '—', r.ocr ? (r.ocr.text || r.ocr.err || '').slice(0, 300) : '',
+      st(r) === 'bad' ? 'суммы тикета нет на скрине' : st(r) === 'nosum' ? 'на скриншоте нет суммы (обрезан скрин или показан не тот экран)' : reviewReason(r), r.page];
+    const W = [14, 12, 22, 22, 14, 12, 12, 14, 60, 40, 6];
+    const bad = all.filter((r) => st(r) === 'bad'), rev = all.filter((r) => st(r) === 'review'), err = all.filter((r) => st(r) === 'error');
+    add('Не сошлось', [head, ...bad.map(line)], W);
+    const nosum = all.filter((r) => st(r) === 'nosum');
+    add('Отсутствует сумма', [head, ...nosum.map(line)], W);
+    add('Проверить вручную', [head, ...rev.map(line)], W);
+    const nofile = all.filter((r) => !r.error && r.links && !r.links.length);           // в User files и Support team's files нет ссылок
+    add('Нет скриншота', [['ticket_id', 'причина', 'page'], ...nofile.map((r) => [numId(r.id), "нет ссылок в User files и Support team's files", r.page])], [14, 50, 6]);
+    add('Ошибки', [['ticket_id', 'причина', 'page'], ...err.map((r) => [numId(r.id), r.note, r.page])], [14, 70, 6]);
+    const out = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+    const blob = new Blob([out], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'screenshot_check_' + new Date().toISOString().slice(0, 10) + '.xlsx';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    msg(`Excel: не сошлось — ${bad.length}; отсутствует сумма — ${nosum.length}; проверить вручную — ${rev.length}; нет скриншота — ${nofile.length}; ошибок — ${err.length}`);
+  };
+
+  // ---------- диагностика: пагинация и данные распознавания сайта (копируется в буфер — пришлите разработчику) ----------
+  $('#ts-diag').onclick = async () => {
+    if (running) return;
+    const L = analyze();
+    if (!L) { msg('Таблица не найдена'); return; }
+    running = true; busy = true;
+    const pg = getPager();
+    const nx = findNext();
+    const info = {
+      pager: { totals: getTotals(), box_found: !!pg, items: pg ? pg.items.map((k) => (k.innerText || '').trim().slice(0, 12)) : null, active: pg && pg.active ? (pg.active.innerText || '').trim() : null,
+        next_found: !!nx, next_html: nx ? nx.outerHTML.slice(0, 250) : null, next_disabled: nx ? isDisabled(nx) : null },
+      list_columns_index: L.idx, list_headers: [...L.table.querySelectorAll('thead th')].map((x) => norm(txt(x)).slice(0, 25)), rows_in_list: L.length, rows_with_links: L.filter((r) => r.userLinks && r.userLinks.length).length,
+      tickets: [],
+    };
+    for (const r of L.slice(0, 20)) {
+      if (info.tickets.length >= 3) break;
+      try {
+        const j = await fetchHistoryRaw(r.id);
+        const arr = findRows(j, ['dateEdit', 'socratResults'], 0) || [];
+        if (!arr.some((o) => /receipt/.test(JSON.stringify(o.socratResults || '')))) continue;
+        const entries = parseApiHistory(j);
+        const sh = analyzeShots(entries);
+        const o = arr.find((x) => x.socratResults && JSON.stringify(x.socratResults).length > 4) || arr[0];
+        if (!info.history_keys) info.history_keys = Object.keys(arr[0] || {});
+        info.tickets.push({ ticket: r.id, ticket_currency_guess: r.cur || (parseApiHistory(j).find((e) => e.cur) || {}).cur || null, links: r.userLinks, analysis: sh, site_suspect: siteSuspect({ shot: sh }), socrat_full: JSON.stringify(o.socratResults).slice(0, 3000) });
+      } catch (e) { info.tickets.push({ ticket: r.id, error: e.message }); }
+      await sleep(CFG.apiGapMs);
+    }
+    busy = false; running = false;
+    const json = JSON.stringify(info, null, 1);
+    console.log('[ts diag]', info);
+    copy(json);
+    const pre = $('#ts-pre');
+    pre.style.display = 'block'; pre.textContent = json;
+    msg('Результат диагностики скопирован в буфер — пришлите его.');
+    run();
+  };
+
+  // ---------- тест распознавания: качаем картинку первого тикета со ссылкой в User files и показываем, что прочитано ----------
+  $('#ts-ocrtest').onclick = async () => {
+    if (running) return;
+    const L = analyze();
+    if (!L) { msg('Таблица не найдена'); return; }
+    const row = L.find((r) => r.userLinks && r.userLinks.length);
+    if (!row) { msg('В списке нет ни одной ссылки на файл пользователя (колонка User files)'); return; }
+    running = true; busy = true;
+    const info = { ticket: row.id, link: row.userLinks[0] };
+    const t0 = Date.now();
+    try {
+      const url = new URL(row.userLinks[0], location.origin).href;
+      const t1 = Date.now();
+      const o = await recognizeUrl(url);
+      info.engine = o.engine; info.bytes = o.bytes;
+      info.seconds = Math.round((Date.now() - t1) / 100) / 10; info.confidence = Math.round(o.conf); info.readable = readable(o);
+      info.text = o.text.replace(/\s+/g, ' ').trim().slice(0, 1500);
+      info.standalone_numbers = sumCands(o.text, true);
+    } catch (e) { info.error = e.message; info.fatal = !!e.fatal; }
+    busy = false; running = false;
+    const json = JSON.stringify(info, null, 1);
+    console.log('[tn ocr test]', info);
+    copy(json);
+    const pre = $('#ts-pre');
+    pre.style.display = 'block'; pre.textContent = json;
+    msg(info.error ? 'Распознавание не сработало — результат скопирован в буфер, пришлите его.' : 'Готово. Результат скопирован в буфер — пришлите его.');
+    run();
+  };
+
+  // ---------- автозапуск при изменении таблицы ----------
+  let timer = null;
+  new MutationObserver((muts) => {
+    if (busy || running || muts.every((m) => panel.contains(m.target) || launcher.contains(m.target))) return;
+    clearTimeout(timer);
+    timer = setTimeout(run, 400);
+  }).observe(document.body, { childList: true, subtree: true });
+
+  syncUI();
+  setTimeout(run, 800);
+})();
